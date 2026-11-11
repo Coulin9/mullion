@@ -33,10 +33,70 @@
 #include <random>
 #include <unordered_map>
 
+#ifdef MULLION_NATIVE
+#include <directx-native/dxn_shared.h>
+#include <unistd.h>
+#endif
+
 namespace mullion {
 
 #pragma region Shared Texture
 
+#ifdef MULLION_NATIVE
+struct TextureShare : RcObject {
+  dxn_shared_texture descriptor = {.fd = -1};
+
+  ~TextureShare() {
+    if (descriptor.fd >= 0)
+      close(descriptor.fd);
+  }
+
+  void decRef() {
+    if (!RcObject::decRef())
+      delete this;
+  }
+
+  HANDLE legacyHandle() { return &descriptor; }
+};
+
+static HRESULT
+AllocateSharedTexture(
+    MTLD3D11Device *device, const D3D11_TEXTURE2D_DESC1 &desc, WMTTextureInfo info, const dxn_shared_texture *source,
+    Rc<Texture> &texture, Rc<TextureShare> &share
+) {
+  if (desc.SampleDesc.Quality || desc.CPUAccessFlags || (desc.BindFlags & D3D11_BIND_DEPTH_STENCIL) ||
+      (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) ||
+      (!source && (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE)))
+    return E_INVALIDARG;
+
+  MTL_DXGI_FORMAT_DESC format;
+  auto metal = device->GetMTLDevice();
+  if (FAILED(MTLQueryDXGIFormat(metal, desc.Format, format)) ||
+      (format.Flag & (MTL_DXGI_FORMAT_BC | MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER |
+                      MTL_DXGI_FORMAT_VIDEO_PLANAR | MTL_DXGI_FORMAT_EMULATED_RGB32)))
+    return E_INVALIDARG;
+
+  Flags<TextureAllocationFlag> flags;
+  if (desc.Usage == D3D11_USAGE_IMMUTABLE)
+    flags.set(TextureAllocationFlag::GpuReadonly);
+  if (!(desc.BindFlags & (D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET)))
+    flags.set(TextureAllocationFlag::ShaderReadonly);
+
+  Rc<TextureShare> result = new TextureShare();
+  HRESULT hr = AllocateNativeLinearTexture(metal, info, format.BytesPerTexel, flags, source, result->descriptor, texture);
+  if (FAILED(hr))
+    return hr;
+
+  auto &meta = result->descriptor.meta;
+  meta.dxgi_format = desc.Format;
+  meta.usage = desc.Usage;
+  meta.bind_flags = desc.BindFlags;
+  meta.misc_flags = desc.MiscFlags;
+  meta.texture_layout = desc.TextureLayout;
+  share = std::move(result);
+  return S_OK;
+}
+#else
 // a shared texture's handle is an ordinary file mapping whose bytes say which shared texture it belongs to: the
 // carrier pattern of d3d11_fence.cpp with a tag of its own, so "a shared texture still opens as a texture, and
 // cannot open as a fence" (tests/d3d11/d3d11_shared_fence.cpp). the texture itself travels as the mach port of
@@ -204,6 +264,7 @@ JoinShare(const SharedTextureData &data, HANDLE carried = nullptr) {
   share_registry.emplace(data.share_id, share.ptr());
   return share;
 }
+#endif
 
 #pragma endregion
 
@@ -526,6 +587,9 @@ public:
     if (this->wrapped_resource)
       return TResourceBase<tag_texture, IMTLMinLODClampable>::CreateSharedHandle(Attributes, Access, pName, pNTHandle);
     InitReturnPtr(pNTHandle);
+#ifdef MULLION_NATIVE
+    return E_NOTIMPL;
+#else
     if (!pNTHandle || !share_ || !(this->desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE))
       return E_INVALIDARG;
     // "The name is limited to MAX_PATH characters." (Microsoft Learn, ID3D11Fence::CreateSharedHandle)
@@ -587,6 +651,7 @@ public:
       return E_FAIL;
     }
     return S_OK;
+#endif
   }
 
   void SetMinLOD(float MinLod) override { min_lod = MinLod; }
@@ -674,6 +739,29 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
   auto shared_flag =
       D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
   if (finalDesc.MiscFlags & shared_flag) {
+#ifdef MULLION_NATIVE
+    if constexpr (tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+      finalDesc.MiscFlags &= ~DXN_MISC_LINEAR_EXPORT;
+      Rc<TextureShare> share;
+      HRESULT hr = AllocateSharedTexture(pDevice, finalDesc, info, nullptr, texture, share);
+      if (FAILED(hr))
+        return hr;
+      // New SHM is already zero-filled. Finish any initial upload before
+      // another device can read it through the exported fd.
+      if (pInitialData) {
+        hr = initialize(Rc<TextureAllocation>(texture->current()));
+        if (FAILED(hr))
+          return hr;
+        if (auto seq = initializer.flushToWait())
+          initializer.wait(seq);
+      }
+      *ppTexture = reinterpret_cast<typename tag::COM_IMPL *>(
+          ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), std::move(share), {}, pDevice))
+      );
+      return S_OK;
+    }
+    return E_NOTIMPL;
+#else
     // use a dedicated path for now, because there are other works for private storage mode
 
     Flags<TextureAllocationFlag> flags;
@@ -763,6 +851,7 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
         ref(new DeviceTexture<tag>(&finalDesc, std::move(texture), std::move(share), std::move(keyed_mutex), pDevice))
     );
     return S_OK;
+#endif
   }
 
   Flags<TextureAllocationFlag> flags;
@@ -816,6 +905,7 @@ CreateDeviceTexture3D(MTLD3D11Device *pDevice,
                                                      pInitialData, ppTexture);
 }
 
+#ifndef MULLION_NATIVE
 template <typename tag>
 HRESULT
 ImportSharedTextureInternal(
@@ -875,6 +965,7 @@ ImportSharedTextureInternal(
       new DeviceTexture<tag>(&finalDesc, std::move(texture), Rc<TextureShare>(share), std::move(keyed_mutex), pDevice);
   return device_texture->QueryInterface(riid, ppTexture);
 }
+#endif
 
 // a texture over a Metal texture another API made (D3D11On12's CreateWrappedResource): the description must make
 // the same Metal texture, which its format and size check
@@ -931,6 +1022,56 @@ WrapTexture(
   }
 }
 
+#ifdef MULLION_NATIVE
+HRESULT
+ImportSharedTexture(MTLD3D11Device *device, HANDLE handle, REFIID riid, void **out) {
+  InitReturnPtr(out);
+  const auto *source = static_cast<const dxn_shared_texture *>(handle);
+  if (!dxn_shared_check(source, DXN_SHARED_TEXTURE_MAGIC, sizeof(*source)))
+    return E_INVALIDARG;
+  if (!out)
+    return S_FALSE;
+
+  D3D11_TEXTURE2D_DESC1 desc{};
+  desc.Width = source->meta.width;
+  desc.Height = source->meta.height;
+  desc.MipLevels = source->meta.mip_levels;
+  desc.ArraySize = source->meta.array_size;
+  desc.Format = DXGI_FORMAT(source->meta.dxgi_format);
+  desc.SampleDesc = {source->meta.sample_count, source->meta.sample_quality};
+  desc.Usage = D3D11_USAGE_DEFAULT;
+  desc.BindFlags = source->meta.bind_flags;
+  desc.CPUAccessFlags = source->meta.cpu_access_flags;
+  desc.MiscFlags = (source->meta.misc_flags | D3D11_RESOURCE_MISC_SHARED) & ~DXN_MISC_LINEAR_EXPORT;
+  desc.TextureLayout = D3D11_TEXTURE_LAYOUT_UNDEFINED;
+
+  WMTTextureInfo info{};
+  D3D11_TEXTURE2D_DESC1 normalized;
+  HRESULT hr = CreateMTLTextureDescriptor(device, &desc, &normalized, &info);
+  if (FAILED(hr))
+    return hr;
+
+  Rc<Texture> texture;
+  Rc<TextureShare> share;
+  hr = AllocateSharedTexture(device, normalized, info, source, texture, share);
+  if (FAILED(hr))
+    return hr;
+  Com<DeviceTexture<tag_texture_2d>> resource =
+      new DeviceTexture<tag_texture_2d>(&normalized, std::move(texture), std::move(share), {}, device);
+  return resource->QueryInterface(riid, out);
+}
+
+HRESULT
+ImportSharedTextureFromNtHandle(MTLD3D11Device *device, HANDLE handle, REFIID riid, void **out) {
+  return ImportSharedTexture(device, handle, riid, out);
+}
+
+HRESULT
+ImportSharedTextureByName(MTLD3D11Device *, LPCWSTR, DWORD, REFIID, void **out) {
+  InitReturnPtr(out);
+  return E_NOTIMPL;
+}
+#else
 HRESULT
 ImportSharedTexture(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void **ppTexture) {
   InitReturnPtr(ppTexture);
@@ -1061,6 +1202,7 @@ ImportSharedTextureByName(
   CloseHandle(mapping);
   return res;
 }
+#endif
 
 #pragma endregion
 

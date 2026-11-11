@@ -275,6 +275,7 @@ template WMT::MetalDrawable Presenter::encodeCommands(
 
 void
 Presenter::drawToWindow(double after) {
+#ifdef _WIN32
   WindowFrame frame;
   {
     std::lock_guard lock(window_mutex_);
@@ -301,6 +302,7 @@ Presenter::drawToWindow(double after) {
   ReleaseDC(window_, dc);
   window_last_draw_ = std::chrono::steady_clock::now();
   WMT::MetalDrawable{}.countPresent(statistics_, frame.number);
+#endif
 }
 
 HRESULT

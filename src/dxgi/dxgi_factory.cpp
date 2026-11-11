@@ -59,6 +59,7 @@ class StatusNotifications {
     HWND window;
     UINT message;
   };
+#ifdef _WIN32
   inline static mullion::mutex mutex_;
   inline static std::unordered_map<DWORD, Target> occlusion_, stereo_;
   inline static DWORD cookie_ = 0;
@@ -123,6 +124,11 @@ public:
       hook_ = nullptr;
     }
   }
+#else
+public:
+  static HRESULT add(bool, Target, DWORD *) { return DXGI_ERROR_UNSUPPORTED; }
+  static void remove(bool, DWORD) {}
+#endif
 };
 
 class MTLDXGIFactory : public MTLDXGIObject<IDXGIFactory6> {

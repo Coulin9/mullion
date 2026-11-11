@@ -1,0 +1,7 @@
+[wrap-git]
+url = https://github.com/osy/directx-native.git
+revision = 942bd55dc51c06ec6b905bbf64ebab8e913aed43
+depth = 1
+
+[provide]
+dependency_names = directx-native, directx-native-headers

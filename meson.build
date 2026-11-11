@@ -27,7 +27,13 @@ mullion_native_include_dirs = [
 ]
 
 if not mullion_crossbuild
-  mullion_include_dirs += mullion_native_include_dirs
+  mullion_include_dirs += ['./include/native/windows']
+  native_directx_headers = get_option('native_directx_headers')
+  if native_directx_headers == '' or not fs.is_file(native_directx_headers / 'd3d12.h')
+    error('Set native_directx_headers to the MinGW-w64 include directory')
+  endif
+  # Use the host's standard C headers and Mullion's Win32 shims before MinGW.
+  add_project_arguments('-idirafter', native_directx_headers, language: ['c', 'cpp'])
 endif
 
 source_prefix_path = fs.relative_to(
@@ -96,7 +102,7 @@ endif
 mullion_include_path = include_directories(mullion_include_dirs)
 mullion_native_include_path = include_directories(mullion_native_include_dirs)
 
-if not fs.is_file('include/native/directx/d3d11.h')
+if mullion_crossbuild and not fs.is_file('include/native/directx/d3d11.h')
   error('Don\'t forget to clone submodules. `git submodule update --init --recursive`')
 endif
 
@@ -116,12 +122,12 @@ xcrun = find_program('xcrun')
 
 metalir_generator = generator(xcrun,
   output    : [ '@BASENAME@.air'],
-  arguments : [ '-sdk', 'macosx', 'metal', '-o', '@OUTPUT@', '-c', '@INPUT@', '@EXTRA_ARGS@'],
+  arguments : [ '--no-cache', '-sdk', 'macosx', 'metal', '-o', '@OUTPUT@', '-c', '@INPUT@', '@EXTRA_ARGS@'],
 )
 
 metallib_generator = generator(xcrun,
   output    : [ '@BASENAME@.metallib'],
-  arguments : [ '-sdk', 'macosx', 'metallib', '-o', '@OUTPUT@', '@INPUT@'],
+  arguments : [ '--no-cache', '-sdk', 'macosx', 'metallib', '-o', '@OUTPUT@', '@INPUT@'],
 )
 
 xxd = find_program('xxd')
@@ -137,7 +143,11 @@ if mullion_debug
 add_project_arguments('-DMULLION_DEBUG=1', language: 'cpp')
 endif
 
-add_project_arguments('-DMULLION_PAGE_SIZE=4096', language: 'cpp')
+if not mullion_crossbuild and cpu_family == 'aarch64'
+  add_project_arguments('-DMULLION_PAGE_SIZE=16384', language: 'cpp')
+else
+  add_project_arguments('-DMULLION_PAGE_SIZE=4096', language: 'cpp')
+endif
 
 # a build of a changed tree is numbered by the line of build_log that holds its commit and the hash of its diff (a new
 # file counts once meson.build or another tracked file names it); a clean tree's build is its commit
@@ -193,6 +203,10 @@ if mullion_crossbuild
 else
   wine_builtin_dll = false
   windows_native_install_dir = ''
+  add_project_arguments('-DMULLION_NATIVE=1', '-DWIDL_EXPLICIT_AGGREGATE_RETURNS=1', language: ['c', 'cpp'])
+  directx_native_dep = dependency('directx-native',
+    fallback: ['directx-native', 'directx_native_dep'],
+    default_options: ['tests=false'])
 endif
 
 native_compiler_arch = cpu_family == 'aarch64' ? 'arm64' : 'x86_64'

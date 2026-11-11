@@ -20,6 +20,12 @@
 #include "d3d12_pageable.hpp"
 #include "com/com_pointer.hpp"
 
+#ifdef MULLION_NATIVE
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 namespace mullion {
 
 class MTLD3D12HeapImpl : public MTLD3D12Pageable<MTLD3D12Heap> {
@@ -117,6 +123,7 @@ public:
 
   HRESULT
   Import(const void *Address, HANDLE Mapping) {
+#ifdef _WIN32
     void *address = Mapping ? MapViewOfFile(Mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0) : const_cast<void *>(Address);
     memory = std::shared_ptr<void>(address, [Mapping](void *pointer) { if (Mapping && pointer) UnmapViewOfFile(pointer); });
     MEMORY_BASIC_INFORMATION region, next;
@@ -130,6 +137,9 @@ public:
              D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT,
              D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER};
     return S_OK;
+#else
+    return E_NOTIMPL;
+#endif
   }
 
   virtual D3D12_HEAP_DESC *STDMETHODCALLTYPE
@@ -137,7 +147,62 @@ public:
     *__ret = desc_;
     return __ret;
   };
+
+#ifdef MULLION_NATIVE
+  HRESULT
+  ImportFromFD(int fd, uint64_t offset, uint64_t size, D3D12_HEAP_TYPE type) {
+    const auto page_size = static_cast<uint64_t>(getpagesize());
+    struct stat info;
+    if (fd < 0 || !size || offset % page_size || size % page_size || fstat(fd, &info) != 0 || info.st_size < 0)
+      return E_INVALIDARG;
+    const auto file_size = static_cast<uint64_t>(info.st_size);
+    if (offset > file_size || size > file_size - offset)
+      return E_INVALIDARG;
+
+    D3D12_HEAP_PROPERTIES properties{type, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_MEMORY_POOL_UNKNOWN, 1, 1};
+    switch (type) {
+    case D3D12_HEAP_TYPE_DEFAULT:
+    case D3D12_HEAP_TYPE_UPLOAD:
+    case D3D12_HEAP_TYPE_READBACK:
+      break;
+    case D3D12_HEAP_TYPE_CUSTOM:
+      properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+      properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+      break;
+    default:
+      return E_NOTIMPL;
+    }
+
+    void *address = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, static_cast<off_t>(offset));
+    if (address == MAP_FAILED)
+      return E_FAIL;
+    memory = std::shared_ptr<void>(address, [size](void *mapped) { munmap(mapped, size); });
+    desc_ = {size, properties, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS};
+    return S_OK;
+  }
+#endif
 };
+
+#ifdef MULLION_NATIVE
+extern "C" int32_t
+mullion_open_existing_heap_from_fd(
+    void *device, int fd, uint64_t offset, uint64_t size, uint32_t heap_type, uint32_t, const void *iid, void **out_heap
+) {
+  InitReturnPtr(out_heap);
+  if (!device || !iid || !out_heap)
+    return E_INVALIDARG;
+  auto d3d12_device = com_cast<ID3D12Device>(static_cast<IUnknown *>(device));
+  if (!d3d12_device)
+    return E_NOINTERFACE;
+  // Neptune calls this on a device created by this backend.
+  auto *native_device = static_cast<MTLD3D12Device *>(d3d12_device.ptr());
+  auto heap = Com(new MTLD3D12HeapImpl(native_device));
+  HRESULT result = heap->ImportFromFD(fd, offset, size, static_cast<D3D12_HEAP_TYPE>(heap_type));
+  if (FAILED(result))
+    return result;
+  return heap->QueryInterface(*static_cast<const IID *>(iid), out_heap);
+}
+#endif
 
 HRESULT
 OpenHeap(MTLD3D12Device *pDevice, const void *Address, HANDLE Mapping, REFIID riid, void **ppHeap) {

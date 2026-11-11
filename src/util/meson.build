@@ -26,12 +26,14 @@ util_src = files([
 ])
 
 if not mullion_crossbuild
+  util_deps = [ directx_native_dep ]
   util_src += files([
     'wsi_monitor_headless.cpp',
     'wsi_window_headless.cpp',
     'wsi_platform_darwin.cpp',
   ])
 else
+  util_deps = []
   util_src += files([
     'wsi_monitor_win32.cpp',
     'wsi_window_win32.cpp',
@@ -41,9 +43,11 @@ endif
 
 util_lib = static_library('util', util_src,
   include_directories : [ mullion_include_path ],
+  dependencies        : util_deps,
 )
 
 util_dep = declare_dependency(
   link_with           : [ util_lib ],
   include_directories : [ include_directories('.') ],
+  dependencies        : util_deps,
 )

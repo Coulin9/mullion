@@ -174,7 +174,7 @@ class MTLD3D12PipelineLibrary : public MTLD3D12DeviceChild<ID3D12PipelineLibrary
     std::vector<Sha1Digest> shaders;
   };
   mullion::mutex mutex_;
-  std::map<std::wstring, Entry, std::less<>> entries_;
+  std::map<str::wide_string, Entry, std::less<>> entries_;
   PipelineShaderCache shaders_;
 
   SIZE_T
@@ -286,10 +286,10 @@ public:
       }
       if (length > (size - offset) / sizeof(WCHAR))
         return FAIL(E_INVALIDARG);
-      std::wstring name(length, L'\0');
+      str::wide_string name(length, MULLION_WIDE('\0'));
       memcpy(name.data(), data + offset, length * sizeof(WCHAR));
       offset += length * sizeof(WCHAR);
-      if (name.find(L'\0') != std::wstring::npos || !entries_.try_emplace(std::move(name), std::move(entry)).second)
+      if (name.find(MULLION_WIDE('\0')) != str::wide_string::npos || !entries_.try_emplace(std::move(name), std::move(entry)).second)
         return FAIL(E_INVALIDARG);
     }
     return S_OK;
@@ -316,7 +316,7 @@ public:
     std::lock_guard lock(mutex_);
     try {
       auto state = static_cast<MTLD3D12PipelineState *>(pipeline);
-      if (entries_.contains(name ? name : L""))
+      if (entries_.contains(name ? name : MULLION_WIDE("")))
         return FAIL(E_INVALIDARG);
       Entry entry{state->library_key, state, {}};
       std::lock_guard shader_lock(state->shader_mutex);
@@ -324,7 +324,7 @@ public:
         data = shaders_.try_emplace(key, data).first->second;
         entry.shaders.push_back(key);
       }
-      entries_.emplace(name ? name : L"", std::move(entry));
+      entries_.emplace(name ? name : MULLION_WIDE(""), std::move(entry));
       return S_OK;
     } catch (const std::bad_alloc &) {
       return FAIL(E_OUTOFMEMORY);

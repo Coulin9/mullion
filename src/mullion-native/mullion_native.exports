@@ -1,0 +1,12 @@
+_CreateDXGIFactory
+_CreateDXGIFactory1
+_CreateDXGIFactory2
+_DXGIGetDebugInterface1
+_D3D11CoreCreateDevice
+_D3D11CreateDevice
+_D3D11CreateDeviceAndSwapChain
+_D3D11On12CreateDevice
+_mullion_native_abi_version
+_mullion_event_create
+_mullion_event_close
+_mullion_event_dup_fd

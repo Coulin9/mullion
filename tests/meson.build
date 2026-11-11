@@ -1,3 +1,11 @@
+if not mullion_crossbuild
+  if get_option('enable_d3d12')
+    subdir('native')
+  endif
+  subdir('host')
+  subdir_done()
+endif
+
 depth_formats = run_command(find_program('python3', native : true), '-c', '''
 import re, subprocess, sys
 text = subprocess.check_output(sys.argv[1:] + ['-E', '-x', 'c++', '-'],

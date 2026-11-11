@@ -5,6 +5,10 @@
 #include <windows.h>
 
 #include "log/log.hpp"
+#include <directx-native/dxn_event.h>
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
 
 #define THREAD_PRIORITY_TIME_CRITICAL 15
 
@@ -19,9 +23,68 @@ inline HANDLE GetCurrentThread() {
 }
 
 inline DWORD GetCurrentProcessId() {
-  mullion::Logger::warn("GetCurrentProcessId not implemented.");
-  return 0;
+  return static_cast<DWORD>(getpid());
 }
+
+inline DWORD GetCurrentThreadId() {
+  uint64_t id = 0;
+  pthread_threadid_np(nullptr, &id);
+  return static_cast<DWORD>(id);
+}
+
+inline BOOL QueryPerformanceFrequency(LARGE_INTEGER *frequency) {
+  frequency->QuadPart = 1000000000;
+  return TRUE;
+}
+
+inline BOOL QueryPerformanceCounter(LARGE_INTEGER *counter) {
+  counter->QuadPart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  return TRUE;
+}
+
+inline void OutputDebugStringA(const char *message) {
+  mullion::Logger::debug(message);
+}
+
+inline BOOL SetEvent(HANDLE handle) {
+  if (!handle || !dxn_event_is_event(handle))
+    return FALSE;
+  dxn_event_signal(handle);
+  return TRUE;
+}
+
+inline HANDLE CreateEventW(SECURITY_ATTRIBUTES *, BOOL manual_reset, BOOL initial_state, LPCWSTR) {
+  return dxn_event_create(manual_reset, initial_state);
+}
+
+constexpr DWORD GENERIC_ALL = 0x10000000;
+constexpr DWORD GENERIC_READ = 0x80000000;
+constexpr DWORD GENERIC_WRITE = 0x40000000;
+
+constexpr DWORD MEM_COMMIT = 0x1000;
+constexpr DWORD MEM_RESERVE = 0x2000;
+constexpr DWORD MEM_RELEASE = 0x8000;
+constexpr DWORD MEM_WRITE_WATCH = 0x200000;
+constexpr DWORD PAGE_READWRITE = 0x04;
+
+inline uint64_t GetTickCount64() {
+  return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) / 1000000;
+}
+
+inline void DebugBreak() { __builtin_debugtrap(); }
+
+struct SYSTEM_INFO {
+  DWORD dwPageSize;
+  DWORD dwAllocationGranularity;
+};
+
+inline void GetSystemInfo(SYSTEM_INFO *info) {
+  info->dwPageSize = getpagesize();
+  info->dwAllocationGranularity = 65536;
+}
+
+void *VirtualAlloc(void *address, size_t length, DWORD flags, DWORD protection);
+BOOL VirtualFree(void *address, size_t length, DWORD flags);
 
 inline BOOL ProcessIdToSessionId(DWORD pid, DWORD *id) {
   mullion::Logger::warn("ProcessIdToSessionId not implemented.");
@@ -83,8 +146,10 @@ inline BOOL ReleaseSemaphore(HANDLE hSemaphore,
 }
 
 inline BOOL CloseHandle(HANDLE hObject) {
-  mullion::Logger::warn("CloseHandle not implemented.");
-  return FALSE;
+  if (!hObject || !dxn_event_is_event(hObject))
+    return FALSE;
+  dxn_event_close(hObject);
+  return TRUE;
 }
 
 inline BOOL DuplicateHandle(HANDLE   hSourceProcessHandle,
@@ -95,8 +160,8 @@ inline BOOL DuplicateHandle(HANDLE   hSourceProcessHandle,
                             BOOL     bInheritHandle,
                             DWORD    dwOptions)
 {
-  mullion::Logger::warn("DuplicateHandle not implemented.");
-  return FALSE;
+  *lpTargetHandle = hSourceHandle ? dxn_event_duplicate(hSourceHandle) : nullptr;
+  return *lpTargetHandle != nullptr;
 }
 
 

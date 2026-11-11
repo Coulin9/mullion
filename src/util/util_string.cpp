@@ -202,11 +202,11 @@ std::string fromws(const WCHAR *ws) {
   return result;
 }
 
-std::wstring tows(const char *mbs) {
+wide_string tows(const char *mbs) {
   size_t srcLen = length(mbs);
-  size_t dstLen = transcodeString<wchar_t>(nullptr, 0, mbs, srcLen);
+  size_t dstLen = transcodeString<WCHAR>(nullptr, 0, mbs, srcLen);
 
-  std::wstring result;
+  wide_string result;
   result.resize(dstLen);
 
   transcodeString(result.data(), dstLen, mbs, srcLen);

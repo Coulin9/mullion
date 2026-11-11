@@ -152,6 +152,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   struct PassSync {
     std::array<WMT::Fence, kGroupPasses + 1> waits;
     unsigned wait_count = 0;
+    bool previous_group_fragment_wait = false;
     std::array<WMT::Fence, kGroupPasses> pixels;
     unsigned pixel_count = 0;
     WMT::Fence update;
@@ -176,10 +177,18 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     }
   }
 
+  static bool
+  SingleColorRender(const EncoderData *pass) {
+    auto render = static_cast<const RenderEncoderData *>(pass);
+    return !pass->stamps && !render->before_head.next.ptr && !render->visibility_buffer && !render->rasterless &&
+           !render->depth.attachment && !render->stencil.attachment && render->render_target_count == 1 &&
+           render->colors[0].attachment && !render->colors[0].resolve_attachment;
+  }
+
   // the next pass's waits and update, in the order the passes are submitted. a pass that may do nothing (and a pass
   // of no encoder) neither waits nor updates: it has no work to order
   PassSync
-  NextSync(const EncoderData *pass) {
+  NextSync(const EncoderData *pass, const EncoderData *previous_render = nullptr) {
     PassSync sync;
     // a Metal 4 pass of compute or blit work that waits for every pass before it, as WaitAll's encoders do, is a
     // segment of the buffer's one compute encoder, which barriers order and whose end updates fence_ (closeCompute).
@@ -196,12 +205,20 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       order_next_ |= pass->overlap == PassOverlap::Ordered;
       return sync;
     }
-    auto overlap = std::exchange(order_next_, false) ? PassOverlap::Ordered : pass->overlap;
+    bool forced = std::exchange(order_next_, false);
+    auto overlap = forced ? PassOverlap::Ordered : pass->overlap;
     if (segment && (overlap == PassOverlap::Ordered || !group_count_ || group_count_ == kGroupPasses)) {
       WaitAll([&](WMT::Fence fence) { sync.waits[sync.wait_count++] = fence; });
       return sync;
     }
     sync.waits[sync.wait_count++] = fence_;
+    // Only the single preceding render pass's fence may move. The queue-wide fence and every forced ordering point
+    // still gate pre-raster work.
+    sync.previous_group_fragment_wait = !forced && overlap == PassOverlap::Ordered && group_count_ == 1 &&
+                                        previous_render && pass->type == EncoderType::Render &&
+                                        static_cast<const RenderEncoderData *>(pass)->fragment_wait_after ==
+                                            previous_render &&
+                                        SingleColorRender(previous_render) && SingleColorRender(pass);
     if (overlap == PassOverlap::Ordered || !group_count_ || group_count_ == kGroupPasses) {
       overlap = PassOverlap::Ordered;
       previous_count_ = group_count_;
@@ -1525,6 +1542,8 @@ public:
     }
     static const bool isolate = !env::getEnvVar("MULLION_D3D12_ISOLATE").empty();
     MetalCommandBuffer cmdbuf = scope.inflight->cmdbuf;
+    const auto previous_submission = inflight_cmdbuf_seq_.load(std::memory_order_relaxed) - 1;
+    uint64_t ordered_buffer = 0;
     uint64_t queries = 0;
     if (profile_)
       for (auto list : recorded)
@@ -1613,6 +1632,8 @@ public:
         own--;
       };
       const uint32_t *decided = nullptr;
+      const EncoderData *previous_render = nullptr;
+      uint64_t previous_render_sequence = 0;
       while (current) {
         // with MULLION_D3D12_ISOLATE set every pass is a command buffer that is waited for, and the trace names each:
         // the last one named is the one the GPU does not finish
@@ -1678,6 +1699,9 @@ public:
         }
         // what a pass of Metal's waits for and updates, in the order the passes are submitted. one of none orders the
         // next where it is Ordered (a list's end, MTLD3D12GraphicsCommandList's Close)
+        auto sequence = inflight_cmdbuf_seq_.load(std::memory_order_relaxed);
+        auto previous = std::exchange(previous_render, nullptr);
+        bool continuing_render = open.encoder.handle;
         PassSync sync;
         switch (current->type) {
         case EncoderType::Null:
@@ -1688,7 +1712,8 @@ public:
         case EncoderType::ComputeParts:
         case EncoderType::Resolve:
           // a pass that goes on in the open encoder is ordered as the one it goes on in
-          sync = open.encoder.handle ? PassSync{} : NextSync(current);
+          sync = continuing_render ? PassSync{} : NextSync(
+              current, sequence == previous_render_sequence && !sparse_mappings ? previous : nullptr);
           break;
         default:
           break;
@@ -1701,13 +1726,35 @@ public:
         case EncoderType::Blit:
         case EncoderType::Compute:
         case EncoderType::ComputeParts:
-        case EncoderType::Resolve:
+        case EncoderType::Resolve: {
+          bool keep = current == kept && unresolved_.empty();
+          if (sync.previous_group_fragment_wait && !keep &&
+              retired_.value.load(std::memory_order_relaxed) < previous_submission) {
+            // The first pass's pre-raster wait alone cannot order vertices which start ahead of that pass's fence.
+            // Preserve the ExecuteCommandLists boundary independently of the fragment-stage dependency.
+            if constexpr (Metal4) {
+              if (gate_->closed)
+                sync.previous_group_fragment_wait = false;
+              else if (ordered_buffer != sequence) {
+                cmdbuf.encodeWaitForEvent(completion_event_, previous_submission);
+                ordered_buffer = sequence;
+              }
+            } else {
+              // Metal 3's completion events are not signaled for every command buffer.
+              sync.previous_group_fragment_wait = false;
+            }
+          }
           if (!EncodePass(cmdbuf, current, attachment, sparse_mappings, *scope.inflight, records, sync, open,
-                          current == kept && unresolved_.empty()))
+                          keep))
             return;
+          if (current->type == EncoderType::Render && !continuing_render && !open.encoder.handle) {
+            previous_render = current;
+            previous_render_sequence = sequence;
+          }
           // its encoder began with an aliasing barrier the queue carried (OrderAliases)
           order_aliases_ = false;
           break;
+        }
         case EncoderType::AccelerationStructure: {
           // which structures are built is the device's, and another queue's builds change it
           gate_->closed.wait(true);
@@ -2101,7 +2148,8 @@ public:
           waits[waited - 2].next.set(&op);
       };
       for (unsigned i = 0; i < sync.wait_count; i++)
-        wait_for(sync.waits[i], WMTRenderStagePreRaster);
+        wait_for(sync.waits[i], i == 1 && sync.previous_group_fragment_wait && !keep ? WMTRenderStageFragment
+                                                                                     : WMTRenderStagePreRaster);
       if (data->before_head.next.get() && sync.update.handle)
         wait_for(sync.update, WMTRenderStagePreRaster);
       for (unsigned i = 0; i < sync.pixel_count; i++)
@@ -2593,8 +2641,10 @@ public:
   ) {
     if (desc_.Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
       return FAIL(DXGI_ERROR_INVALID_CALL);
+#ifdef _WIN32
     if (hWnd == GetDesktopWindow())
       return FAIL(E_ACCESSDENIED);
+#endif
     return mullion::CreateSwapChain(pFactory, device_, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
   }
 

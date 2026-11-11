@@ -1,3 +1,5 @@
+#ifdef _WIN32
+
 #include "mullion_diag.hpp"
 #include "mullion_window.hpp"
 #include "d3d11_swapchain.hpp"
@@ -1232,3 +1234,24 @@ CreateSwapChain(
 };
 
 } // namespace mullion
+
+#else
+
+#include "d3d11_device.hpp"
+
+namespace mullion {
+
+// Neptune creates its swapchains in the guest and presents shared textures.
+HRESULT
+CreateSwapChain(
+    IDXGIFactory1 *, MTLD3D11Device *, HWND, const DXGI_SWAP_CHAIN_DESC1 *,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *, IDXGISwapChain1 **swapchain
+) {
+  if (swapchain)
+    *swapchain = nullptr;
+  return DXGI_ERROR_UNSUPPORTED;
+}
+
+} // namespace mullion
+
+#endif

@@ -207,6 +207,20 @@ VertexShaderVaryings(const D3D12_SHADER_BYTECODE &VS) {
   return 4 * std::popcount(registers);
 }
 
+static bool
+WritesViewportArrayIndex(const D3D12_SHADER_BYTECODE &shader) {
+  using namespace microsoft;
+  CSignatureParser parser;
+  if (!shader.pShaderBytecode || FAILED(DXBCGetOutputSignature(shader.pShaderBytecode, &parser)))
+    return true;
+  const D3D11_SIGNATURE_PARAMETER *parameters;
+  auto count = parser.GetParameters(&parameters);
+  for (uint32_t i = 0; i < count; i++)
+    if (parameters[i].SystemValue == D3D10_SB_NAME_VIEWPORT_ARRAY_INDEX)
+      return true;
+  return false;
+}
+
 HRESULT
 ExtractMTLInputLayoutElements(
     MTLD3D12Device *device, const void *pShaderBytecodeWithInputSignature,
@@ -1354,6 +1368,10 @@ public:
       return hr;
     if (pDesc->GS.pShaderBytecode && FAILED(hr = InitializeShader(device_, pDesc->GS, &shader_gs, &ref_gs)))
       return hr;
+    // Mesh primitive outputs use a different signature. Keep their full viewport
+    // array, as well as any signature the parser cannot establish.
+    auto raster_stage = pDesc->GS.pShaderBytecode ? pDesc->GS : tessellation ? pDesc->DS : pDesc->VS;
+    viewport_array_index = mesh_shader || WritesViewportArrayIndex(raster_stage);
     gs_instances = sm50_shader_t(shader_gs) ? ref_gs.GeometryShader.InstanceCount : 1;
     // the stage before stream output and the rasterizer: the geometry shader, or the vertex shader
     auto last_stage = pDesc->GS.pShaderBytecode ? pDesc->GS : pDesc->VS;

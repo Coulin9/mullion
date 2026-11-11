@@ -44,7 +44,11 @@ public:
     // (tests/d3d11/d3d11_shared_fence.cpp)
     if (!pHandle || !shared || Access != GENERIC_ALL)
       return DXGI_ERROR_INVALID_CALL;
+#ifdef _WIN32
     return shareHandle(mach_port_name, pAttributes, Name, pHandle);
+#else
+    return E_NOTIMPL;
+#endif
   };
 
   UINT64 STDMETHODCALLTYPE GetCompletedValue() final {
@@ -72,13 +76,19 @@ HRESULT
 CreateFence(MTLD3D11Device *pDevice, UINT64 InitialValue, D3D11_FENCE_FLAG Flags, REFIID riid, void **ppFence) {
   InitReturnPtr(ppFence);
   bool shared = !!(Flags & (D3D11_FENCE_FLAG_SHARED | D3D11_FENCE_FLAG_SHARED_CROSS_ADAPTER));
+#ifndef _WIN32
+  if (shared)
+    return E_NOTIMPL;
+#endif
   auto event = pDevice->GetMTLDevice().newSharedEvent();
   if (!event)
     return E_OUTOFMEMORY;
   event.signalValue(InitialValue);
   char mach_port_name[54] = {};
+#ifdef _WIN32
   if (shared && !shareEvent(event, mach_port_name))
     return E_FAIL;
+#endif
   auto fence = Com(new MTLD3D11FenceImpl(pDevice, std::move(event), shared, mach_port_name));
   if (!ppFence)
     return S_FALSE;
@@ -89,6 +99,7 @@ HRESULT
 OpenSharedFence(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void **ppFence) {
   InitReturnPtr(ppFence);
 
+#ifdef _WIN32
   char mach_port_name[54];
   auto event = openSharedEvent(pDevice->GetMTLDevice(), hResource, mach_port_name);
   if (!event)
@@ -97,6 +108,9 @@ OpenSharedFence(MTLD3D11Device *pDevice, HANDLE hResource, REFIID riid, void **p
   if (!ppFence)
     return S_FALSE;
   return fence->QueryInterface(riid, ppFence);
+#else
+  return E_NOTIMPL;
+#endif
 }
 
 } // namespace mullion

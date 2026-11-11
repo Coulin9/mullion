@@ -113,11 +113,11 @@ HRESULT DeserializeLibraryRootSignature(const void *Library, SIZE_T Size, LPCWST
 // subobject types
 struct LibrarySubobject {
   D3D12_STATE_SUBOBJECT_TYPE type;
-  std::wstring name;
+  str::wide_string name;
   // a root signature, serialized
   std::span<const uint8_t> bytes;
   // an association's subobject, then its exports; a hit group's any hit, closest hit and intersection shaders
-  std::vector<std::wstring> names;
+  std::vector<str::wide_string> names;
   // a shader config's payload and attribute sizes, a pipeline config's depth and flags, or state object flags
   uint32_t values[2]{};
 };
@@ -325,10 +325,17 @@ public:
 // of its own, closed with the last copy; null for a handle that names no object
 inline std::shared_ptr<void>
 EventObject(HANDLE event) {
+#ifdef _WIN32
   HANDLE own;
   if (!DuplicateHandle(GetCurrentProcess(), event, GetCurrentProcess(), &own, 0, FALSE, DUPLICATE_SAME_ACCESS))
     return nullptr;
   return std::shared_ptr<void>(own, CloseHandle);
+#else
+  auto own = dxn_event_duplicate(event);
+  if (!own)
+    return nullptr;
+  return std::shared_ptr<void>(own, dxn_event_close);
+#endif
 }
 
 struct Reached {
@@ -441,6 +448,8 @@ public:
   uint32_t SamplerHeapQword = ~0u;
   // the root argument holding the lock table of 64-bit atomics (MTLD3D12Device::GetAtomicLocks), in every one
   uint32_t AtomicLocksQword;
+  // Every bound resource is visible only to the pixel shader.
+  bool PixelOnlyResources = false;
   // the most any root signature uploads: a qword per parameter (a DWORD of root cost at least), then the two heaps and
   // the lock table
   static constexpr uint32_t kMaxUploadQwords = D3D12_MAX_ROOT_COST + 3;
@@ -554,6 +563,9 @@ public:
   bool uses_uav = false;
   // its pixel shader blends a target itself, reading the blend factor after the depth ranges (SM50_SHADER_BLEND)
   bool shader_blend = false;
+  // The rasterizing stage may select any of the 16 D3D viewports. Without that
+  // output, only viewport 0 is used, so Metal needs just one viewport/scissor.
+  bool viewport_array_index = true;
   WMT::Reference<WMT::RenderPipelineState> pso_strip;
   // the vertex shader's output registers, which size a geometry pipeline's object threadgroups (get_gs_vertex_count)
   uint32_t vertex_registers = 0;
@@ -947,6 +959,11 @@ HRESULT CreateCommittedTexture(
     REFIID riid, void **ppResource, D3D12SwapChainBufferRefs *pBufferRefs = nullptr,
     const MullionMetalResource *pTexture = nullptr
 );
+
+#ifdef MULLION_NATIVE
+HRESULT ExportSharedTexture(MTLD3D12Device *device, ID3D12DeviceChild *object, HANDLE *handle);
+HRESULT OpenSharedTexture(MTLD3D12Device *device, HANDLE handle, REFIID riid, void **object);
+#endif
 
 HRESULT
 CreatePlacedTexture(

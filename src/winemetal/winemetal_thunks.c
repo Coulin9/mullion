@@ -379,6 +379,22 @@ wmt_flight_main(DWORD reason, BOOL exiting) {
   }
   }
 }
+#else
+
+// The Wine-specific call counters, semaphore query, and exception recorder
+// have no native Windows services behind them.
+void WMTDiagTimeCalls(void) {}
+
+void WMTDiagCallTotals(struct WMTDiagCall calls[WMTUnixCallCount]) {
+  memset(calls, 0, sizeof(*calls) * WMTUnixCallCount);
+}
+
+int64_t WMTDiagSemaphoreCount(void *semaphore) { return -1; }
+
+const void *WMTFlightSite(const char *format) { return NULL; }
+void WMTFlightRecord(const void *site, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {}
+void WMTFlightDump(const char *reason) {}
+
 #endif
 
 WINEMETAL_API void

@@ -22,6 +22,14 @@
 #include <atomic>
 #include <cassert>
 
+#ifdef MULLION_NATIVE
+#include <directx-native/dxn_shared.h>
+#include <directx-native/dxn_shm.h>
+#include <fcntl.h>
+#include <new>
+#include <unistd.h>
+#endif
+
 namespace mullion {
 
 std::atomic_uint64_t global_texture_seq = {0};
@@ -57,14 +65,15 @@ TextureView::TextureView(TextureAllocation *allocation, unsigned index, TextureV
 
 TextureAllocation::TextureAllocation(
     Texture *descriptor, WMT::Reference<WMT::Buffer> &&buffer, void *mapped_buffer, const WMTTextureInfo &info,
-    unsigned bytes_per_row, Flags<TextureAllocationFlag> flags
+    unsigned bytes_per_row, Flags<TextureAllocationFlag> flags, uint64_t offset
 ) :
     descriptor(descriptor),
     mappedMemory(mapped_buffer),
     buffer_(std::move(buffer)),
     flags_(flags) {
   auto info_copy = info;
-  obj_ = buffer_.newTexture(info_copy, 0, bytes_per_row);
+  if (buffer_)
+    obj_ = buffer_.newTexture(info_copy, offset, bytes_per_row);
 
   gpuResourceID = info_copy.gpu_resource_id;
   machPort = 0;
@@ -224,6 +233,95 @@ Texture::allocate(Flags<TextureAllocationFlag> flags, WMT::Heap heap, uint64_t h
   flags.set(TextureAllocationFlag::AllocatedOnHeap);
   return new TextureAllocation(this, heap.newTexture(info, heap_offset), info, flags);
 }
+
+#ifdef MULLION_NATIVE
+Rc<TextureAllocation>
+Texture::allocateFromBuffer(
+    WMT::Reference<WMT::Buffer> &&buffer, void *memory, uint64_t offset, Flags<TextureAllocationFlag> flags
+) {
+  return new TextureAllocation(this, std::move(buffer), memory, info_, bytes_per_row_, flags, offset);
+}
+
+HRESULT
+AllocateNativeLinearTexture(
+    WMT::Device device, WMTTextureInfo info, uint32_t bytes_per_texel, Flags<TextureAllocationFlag> flags,
+    const dxn_shared_texture *source, dxn_shared_texture &descriptor, Rc<Texture> &storage
+) {
+  if (info.type != WMTTextureType2D || info.mipmap_level_count != 1 || info.array_length != 1 ||
+      info.sample_count != 1 || !info.width || !info.height || !bytes_per_texel)
+    return E_INVALIDARG;
+  if (source && (!dxn_shared_check(source, DXN_SHARED_TEXTURE_MAGIC, sizeof(*source)) || source->fd < 0 ||
+                 source->plane_count != 1 || source->drm_modifier != 0 ||
+                 source->meta.width != info.width || source->meta.height != info.height ||
+                 source->meta.mip_levels != 1 || source->meta.array_size != 1 || source->meta.sample_count != 1))
+    return E_INVALIDARG;
+
+  const uint64_t alignment = device.minimumLinearTextureAlignmentForPixelFormat(
+      WMTPixelFormat(ORIGINAL_FORMAT(info.pixel_format)));
+  const uint64_t row_size = uint64_t(info.width) * bytes_per_texel;
+  if (!alignment || row_size > UINT32_MAX)
+    return E_INVALIDARG;
+
+  const uint64_t pitch = source ? source->planes[0].pitch : align(row_size, alignment);
+  const uint64_t offset = source ? source->planes[0].offset : 0;
+  if (pitch < row_size || pitch > UINT32_MAX || pitch % alignment || offset % alignment)
+    return E_INVALIDARG;
+  const uint64_t size = pitch * info.height;
+  if (size > UINT32_MAX || (source && source->size < size))
+    return E_INVALIDARG;
+
+  // The Metal buffer owns the full page-aligned mapping, including the
+  // padding between the page floor and the first texel.
+  const uint64_t delta = offset % dxn_shm_page_size();
+  const uint64_t mapped_size = dxn_shm_page_align(delta + size);
+  const int fd = source ? fcntl(source->fd, F_DUPFD_CLOEXEC, 0) : dxn_shm_create(mapped_size);
+  if (fd < 0)
+    return E_FAIL;
+
+  dxn_shm_mapping mapping;
+  if (dxn_shm_map(fd, offset - delta, mapped_size, &mapping) != 0) {
+    close(fd);
+    return E_INVALIDARG;
+  }
+  WMT::Reference<WMT::Buffer> backing(MTLDevice_newMappedBuffer(device, mapping.base, mapping.length));
+  if (!backing) {
+    dxn_shm_unmap(&mapping);
+    close(fd);
+    return E_OUTOFMEMORY;
+  }
+
+  info.options = WMTResourceHazardTrackingModeUntracked;
+  info.mach_port = 0;
+  flags.set(TextureAllocationFlag::Shared);
+  try {
+    Rc<Texture> texture = new Texture(unsigned(size), unsigned(pitch), info, device);
+    auto allocation = texture->allocateFromBuffer(std::move(backing), static_cast<uint8_t *>(mapping.base) + delta,
+                                                  delta, flags);
+    if (!allocation->texture()) {
+      close(fd);
+      return E_FAIL;
+    }
+    texture->rename(std::move(allocation));
+    storage = std::move(texture);
+  } catch (const std::bad_alloc &) {
+    close(fd);
+    return E_OUTOFMEMORY;
+  }
+
+  descriptor = {};
+  DXN_SHARED_INIT(&descriptor, DXN_SHARED_TEXTURE_MAGIC);
+  descriptor.fd = fd;
+  descriptor.meta.width = info.width;
+  descriptor.meta.height = info.height;
+  descriptor.meta.mip_levels = 1;
+  descriptor.meta.array_size = 1;
+  descriptor.meta.sample_count = 1;
+  descriptor.plane_count = 1;
+  descriptor.planes[0] = {offset, pitch};
+  descriptor.size = size;
+  return S_OK;
+}
+#endif
 
 Rc<TextureAllocation>
 Texture::import(mach_port_t mach_port) {

@@ -27,7 +27,11 @@ typedef int32_t *LPLONG;
 
 typedef int32_t HRESULT;
 
-typedef wchar_t WCHAR;
+#ifdef __cplusplus
+typedef char16_t WCHAR;
+#else
+typedef uint16_t WCHAR;
+#endif
 typedef WCHAR *NWPSTR, *LPWSTR, *PWSTR;
 typedef unsigned char UCHAR, *PUCHAR;
 
@@ -55,6 +59,7 @@ typedef int16_t SHORT;
 typedef uint16_t USHORT;
 
 typedef int64_t LONGLONG;
+typedef int64_t LONG64;
 typedef int64_t INT64;
 
 typedef uint64_t ULONGLONG;
@@ -132,9 +137,9 @@ typedef UINT_PTR* PUINT_PTR;
 #endif /*STRICT*/
 
 typedef char* LPSTR;
-typedef wchar_t* LPWSTR;
+typedef WCHAR* LPWSTR;
 typedef const char* LPCSTR;
-typedef const wchar_t* LPCWSTR;
+typedef const WCHAR* LPCWSTR;
 
 typedef struct LUID {
   DWORD LowPart;
@@ -252,6 +257,16 @@ typedef struct RGNDATA {
 #define E_NOTIMPL     ((HRESULT)0x80004001)
 #define E_OUTOFMEMORY ((HRESULT)0x8007000E)
 #define E_POINTER     ((HRESULT)0x80004003)
+#define E_ACCESSDENIED ((HRESULT)0x80070005)
+#define E_HANDLE      ((HRESULT)0x80070006)
+
+#define D3D10_ERROR_TOO_MANY_UNIQUE_STATE_OBJECTS ((HRESULT)0x88790001)
+#define D3D11_ERROR_TOO_MANY_UNIQUE_STATE_OBJECTS ((HRESULT)0x887C0001)
+#define D3D11_ERROR_DEFERRED_CONTEXT_MAP_WITHOUT_INITIAL_DISCARD ((HRESULT)0x887C0004)
+#define D3D12_ERROR_ADAPTER_NOT_FOUND ((HRESULT)0x887E0001)
+#define D3D12_ERROR_DRIVER_VERSION_MISMATCH ((HRESULT)0x887E0002)
+
+#define MAKEFOURCC(a, b, c, d) ((DWORD)(BYTE)(a) | (DWORD)(BYTE)(b) << 8 | (DWORD)(BYTE)(c) << 16 | (DWORD)(BYTE)(d) << 24)
 
 #define DXGI_STATUS_OCCLUDED                     ((HRESULT)0x087a0001)
 #define DXGI_STATUS_CLIPPED                      ((HRESULT)0x087a0002)
@@ -388,13 +403,13 @@ typedef struct RGNDATA {
 # define DEFINE_ENUM_FLAG_OPERATORS(type) \
 extern "C++" \
 { \
-    inline type operator &(type x, type y) { return (type)((int)x & (int)y); } \
-    inline type operator &=(type &x, type y) { return (type &)((int &)x &= (int)y); } \
-    inline type operator ~(type x) { return (type)~(int)x; } \
-    inline type operator |(type x, type y) { return (type)((int)x | (int)y); } \
-    inline type operator |=(type &x, type y) { return (type &)((int &)x |= (int)y); } \
-    inline type operator ^(type x, type y) { return (type)((int)x ^ (int)y); } \
-    inline type operator ^=(type &x, type y) { return (type &)((int &)x ^= (int)y); } \
+    constexpr type operator &(type x, type y) { return (type)((int)x & (int)y); } \
+    constexpr type &operator &=(type &x, type y) { return x = x & y; } \
+    constexpr type operator ~(type x) { return (type)~(int)x; } \
+    constexpr type operator |(type x, type y) { return (type)((int)x | (int)y); } \
+    constexpr type &operator |=(type &x, type y) { return x = x | y; } \
+    constexpr type operator ^(type x, type y) { return (type)((int)x ^ (int)y); } \
+    constexpr type &operator ^=(type &x, type y) { return x = x ^ y; } \
 }
 #else
 # define DEFINE_ENUM_FLAG_OPERATORS(type)

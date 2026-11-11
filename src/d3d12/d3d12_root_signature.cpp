@@ -493,6 +493,9 @@ public:
       blob_.assign(bytes, bytes + serialized->GetBufferSize());
     }
 
+    PixelOnlyResources = !(desc.Flags & (D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE |
+                                         D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+                                         D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED));
     if (desc.NumParameters) {
       const bool local = desc.Flags & D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE;
       constexpr auto local_limit =
@@ -502,6 +505,8 @@ public:
         if (!desc.pParameters)
           return FAIL(E_INVALIDARG);
         auto &parameter = desc.pParameters[i];
+        PixelOnlyResources &= parameter.ShaderVisibility == D3D12_SHADER_VISIBILITY_PIXEL ||
+                              parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         // DXR, Shader table memory initialization: local arguments use their byte sizes and alignment.
         if (local) {
           if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)

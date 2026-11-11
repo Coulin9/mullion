@@ -207,6 +207,11 @@ STATIC_ASSERT(sizeof(WMTBufferInfo) == 32);
 
 WINEMETAL_API obj_handle_t MTLDevice_newBuffer(obj_handle_t device, struct WMTBufferInfo *info);
 
+#ifdef MULLION_NATIVE
+/* On success the returned buffer owns the mmap window. */
+WINEMETAL_API obj_handle_t MTLDevice_newMappedBuffer(obj_handle_t device, void *memory, uint64_t length);
+#endif
+
 enum WMTSamplerBorderColor : uint8_t {
   WMTSamplerBorderColorTransparentBlack = 0,
   WMTSamplerBorderColorOpaqueBlack = 1,

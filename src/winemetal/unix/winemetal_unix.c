@@ -16,6 +16,9 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <sys/sysctl.h>
+#ifdef MULLION_NATIVE
+#include <sys/mman.h>
+#endif
 #define WINEMETAL_API
 #include "../winemetal_thunks.h"
 #include "../airconv_thunks.h"
@@ -262,6 +265,21 @@ CREATES(_MTLDevice_newBuffer)(void *obj) {
   info->gpu_address = [buffer gpuAddress];
   return STATUS_SUCCESS;
 }
+
+#ifdef MULLION_NATIVE
+obj_handle_t
+MTLDevice_newMappedBuffer(obj_handle_t device, void *memory, uint64_t length) {
+  @autoreleasepool {
+    id<MTLBuffer> buffer = [(id<MTLDevice>)device newBufferWithBytesNoCopy:memory
+                                                                  length:length
+                                                                 options:MTLResourceHazardTrackingModeUntracked
+                                                             deallocator:^(void *address, NSUInteger size) {
+                                                               munmap(address, size);
+                                                             }];
+    return (obj_handle_t)buffer;
+  }
+}
+#endif
 
 static NTSTATUS
 CREATES(_MTLDevice_newSamplerState)(void *obj) {
@@ -3576,9 +3594,39 @@ _SharedEventListener_destroy(void *obj) {
 }
 
 #else
+
+#include <directx-native/dxn_event.h>
+
+@interface WMTNativeEvent : NSObject {
+@public
+  void *handle;
+}
+@end
+
+@implementation WMTNativeEvent
+- (void)dealloc {
+  dxn_event_close(handle);
+  [super dealloc];
+}
+@end
+
 static NTSTATUS
 _MTLSharedEvent_setWin32EventAtValue(void *obj) {
-  // nop
+  struct unixcall_mtlsharedevent_setevent *params = obj;
+  void *duplicate = dxn_event_duplicate((void *)params->event_handle);
+  if (!duplicate)
+    return STATUS_SUCCESS;
+
+  // The Metal notification retains the event until it runs or is dropped.
+  WMTNativeEvent *hold = [[WMTNativeEvent alloc] init];
+  hold->handle = duplicate;
+  [(id<MTLSharedEvent>)params->shared_event
+      notifyListener:(MTLSharedEventListener *)params->shared_event_listener
+             atValue:params->value
+               block:^(id<MTLSharedEvent> event, uint64_t value) {
+                 dxn_event_signal(hold->handle);
+               }];
+  [hold release];
   return STATUS_SUCCESS;
 }
 
@@ -3589,11 +3637,15 @@ _SharedEventListener_start(void *obj) {
 
 static NTSTATUS
 _SharedEventListener_create(void *obj) {
+  struct unixcall_generic_obj_ret *params = obj;
+  params->ret = (obj_handle_t)[[MTLSharedEventListener alloc] init];
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS
 _SharedEventListener_destroy(void *obj) {
+  struct unixcall_generic_obj_noret *params = obj;
+  [(MTLSharedEventListener *)params->handle release];
   return STATUS_SUCCESS;
 }
 
@@ -4075,8 +4127,13 @@ _MTLDevice_supportsPlacementSparse(void *obj) {
   struct unixcall_generic_obj_uint64_ret *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->handle;
   params->ret = 0;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260400
   if (@available(macOS 26.4, *))
     params->ret = [device supportsPlacementSparse];
+#else
+  if ([device respondsToSelector:@selector(supportsPlacementSparse)])
+    params->ret = ((BOOL (*)(id, SEL))objc_msgSend)(device, @selector(supportsPlacementSparse));
+#endif
   return STATUS_SUCCESS;
 }
 

@@ -154,7 +154,15 @@ std::string fromws(const WCHAR *ws);
  * \param [in] mbs Null-terminated string
  * \returns Wide string object
  */
-std::wstring tows(const char *mbs);
+using wide_string = std::basic_string<WCHAR>;
+using wide_string_view = std::basic_string_view<WCHAR>;
+wide_string tows(const char *mbs);
+
+#ifdef _WIN32
+#define MULLION_WIDE(text) L##text
+#else
+#define MULLION_WIDE(text) u##text
+#endif
 
 #ifdef _WIN32
 using path_string = std::wstring;

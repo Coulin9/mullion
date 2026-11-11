@@ -25,11 +25,7 @@
 #include <mutex>
 #include <vector>
 
-#if defined(__MINGW32__)
-
-const GUID kWKPDID_D3DDebugObjectNameW = {0x4cca5fd8, 0x921f, 0x42c8, 0x85, 0x66, 0x70, 0xca, 0xf2, 0xa9, 0xb7, 0x41};
-
-#endif
+inline constexpr GUID kWKPDID_D3DDebugObjectNameW = {0x4cca5fd8, 0x921f, 0x42c8, {0x85, 0x66, 0x70, 0xca, 0xf2, 0xa9, 0xb7, 0x41}};
 
 namespace mullion {
 template <typename... Base> class MTLD3D12Object : public Base... {
@@ -98,7 +94,7 @@ public:
   SetName(const WCHAR *name) override {
     size_t size = 0;
     if (name)
-      size = sizeof(WCHAR) * (wcslen(name) + 1);
+      size = sizeof(WCHAR) * (std::char_traits<WCHAR>::length(name) + 1);
     return SetPrivateData(kWKPDID_D3DDebugObjectNameW, size, name);
   }
 

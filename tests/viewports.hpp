@@ -25,6 +25,12 @@ float4 vs(uint id : SV_VertexID) : SV_Position {
   return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
 }
 struct G { float4 position : SV_Position; uint viewport : SV_ViewportArrayIndex; };
+G vs_indexed(uint id : SV_VertexID) {
+  G g;
+  g.position = vs(id);
+  g.viewport = index;
+  return g;
+}
 [maxvertexcount(3)]
 void gs(triangle float4 corners[3] : SV_Position, inout TriangleStream<G> stream) {
   for (int i = 0; i < 3; i++) {

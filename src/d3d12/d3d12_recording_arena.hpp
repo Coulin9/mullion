@@ -4,8 +4,8 @@
 #include <mutex>
 #include <optional>
 #include <vector>
-#include <windef.h>
-#include <winbase.h>
+#include <windows.h>
+#include "util_win32_compat.h"
 
 namespace mullion {
 

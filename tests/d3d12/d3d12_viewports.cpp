@@ -16,23 +16,29 @@ main(int argc, char **argv) {
   auto vs = compiler.compile(hlsl, "vs", "vs", defines), gs = compiler.compile(hlsl, "gs", "gs", defines),
        ps = compiler.compile(hlsl, "ps", "ps", defines);
   auto ps_plain = compiler.compile(hlsl, "ps_plain", "ps", defines);
+  auto vs_indexed = compiler.compile(hlsl, "vs_indexed", "vs", defines);
   if (vs.empty() || gs.empty() || ps.empty() || ps_plain.empty()) {
     printf("failed: HLSL did not compile\n");
     return 1;
   }
   ComPtr<ID3D12Device> device;
   CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+  CHECK(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options)));
+  const bool vertex_index = options.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation;
+  if (vertex_index && vs_indexed.empty())
+    return 1;
   D3D12_ROOT_PARAMETER constants{D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS};
   constants.Constants = {0, 0, 3};
   auto rs = root_signature(device.Get(), {1, &constants});
   const DXGI_FORMAT format = DXGI_FORMAT_R32G32B32A32_UINT;
-  ComPtr<ID3D12PipelineState> pipelines[2];
-  for (bool geometry : {false, true}) {
+  ComPtr<ID3D12PipelineState> pipelines[3];
+  for (unsigned kind = 0; kind < (vertex_index ? 3u : 2u); kind++) {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = rs.Get();
-    desc.VS = bytecode(vs);
-    desc.PS = bytecode(geometry ? ps : ps_plain);
-    if (geometry)
+    desc.VS = bytecode(kind == 2 ? vs_indexed : vs);
+    desc.PS = bytecode(kind ? ps : ps_plain);
+    if (kind == 1)
       desc.GS = bytecode(gs);
     desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     desc.SampleMask = ~0u;
@@ -41,7 +47,7 @@ main(int argc, char **argv) {
     desc.NumRenderTargets = 1;
     desc.RTVFormats[0] = format;
     desc.SampleDesc = {1, 0};
-    CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipelines[geometry])));
+    CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipelines[kind])));
   }
   ComPtr<ID3D12Resource> target;
   D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
@@ -57,7 +63,16 @@ main(int argc, char **argv) {
   device->CreateRenderTargetView(target.Get(), nullptr, rtv);
 
   // a slot of the readback buffer for each case's pixels
-  const auto all = cases();
+  auto all = cases();
+  // Changing the rasterizing shader changes the Metal viewport count even when
+  // the application leaves its viewport and scissor state in place.
+  using Parts = std::vector<Part>;
+  all.push_back({{Parts{Left, Right}, Parts{Whole, Whole}, plain},
+                 {std::nullopt, std::nullopt, 1},
+                 {std::nullopt, std::nullopt, plain}});
+  all.push_back({{Parts{Left, Right}, Parts{Whole, Whole}, 1},
+                 {std::nullopt, std::nullopt, plain},
+                 {std::nullopt, std::nullopt, 5}});
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
   UINT64 bytes;
   device->GetCopyableFootprints(&target_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
@@ -86,7 +101,8 @@ main(int argc, char **argv) {
   CHECK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
   CHECK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE, IID_PPV_ARGS(&bundle_allocator)));
   CHECK(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)));
-  for (unsigned path = 0; path < 3; path++) {
+  for (unsigned path = 0; path < (vertex_index ? 6u : 3u); path++) {
+    const unsigned submission = path % 3;
     if (path) {
       CHECK(allocator->Reset());
       CHECK(list->Reset(allocator.Get(), nullptr));
@@ -122,15 +138,16 @@ main(int argc, char **argv) {
           UINT conflicting;
         } constants_of{draw.index == plain ? 0 : draw.index, UINT(n + 1), draw.conflicting};
         ComPtr<ID3D12GraphicsCommandList> bundle;
-        if (path == 1)
+        if (submission == 1)
           CHECK(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, bundle_allocator.Get(), nullptr,
                                           IID_PPV_ARGS(&bundle)));
-        auto commands = path == 1 ? bundle.Get() : list.Get();
+        auto commands = submission == 1 ? bundle.Get() : list.Get();
         commands->SetGraphicsRootSignature(rs.Get());
         commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        commands->SetPipelineState(pipelines[draw.index != plain].Get());
+        const unsigned pipeline = draw.index == plain ? 0 : path >= 3 ? 2 : 1;
+        commands->SetPipelineState(pipelines[pipeline].Get());
         commands->SetGraphicsRoot32BitConstants(0, 3, &constants_of, 0);
-        if (path == 2)
+        if (submission == 2)
           commands->ExecuteIndirect(signature.Get(), 1, arguments.Get(), 0, nullptr, 0);
         else
           commands->DrawInstanced(3, 1, 0, 0);

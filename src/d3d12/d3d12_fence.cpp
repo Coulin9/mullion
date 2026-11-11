@@ -26,6 +26,7 @@ namespace mullion {
 
 struct Completion;
 
+#ifdef _WIN32
 // the shared fences something has waited on. a notification of any of their events raises one event, which makes
 // each fence that is still there take its event's value. the event and its wait last as long as the process: a
 // notification Metal keeps for a value a fence never gets, or for a fence that is gone, costs no handle or wait, and
@@ -69,6 +70,7 @@ private:
 
   void Look(PTP_WAIT wait);
 };
+#endif
 
 // a shared fence's value is its event's, which the devices it is shared with signal too. Metal's events only rise, so
 // a shared fence is not set back
@@ -98,6 +100,7 @@ struct Completion : Reached, std::enable_shared_from_this<Completion> {
   // one notification for each value something waits for, which raises the watcher's event once the event has it
   void
   Waiting(uint64_t expected) override {
+#ifdef _WIN32
     if (!event)
       return;
     uint64_t signaled = event.signaledValue();
@@ -108,9 +111,11 @@ struct Completion : Reached, std::enable_shared_from_this<Completion> {
     if (!std::exchange(watched, true))
       watcher.Watch(weak_from_this());
     listener->setEventOnValue(event, watcher.reached, expected);
+#endif
   }
 };
 
+#ifdef _WIN32
 void
 Watcher::Look(PTP_WAIT wait) {
   // set again first: a notification that comes while the fences are looked at has them looked at again
@@ -130,6 +135,7 @@ Watcher::Look(PTP_WAIT wait) {
   for (auto &completion : live)
     completion->Look();
 }
+#endif
 
 class MTLD3D12FenceImpl : public MTLD3D12DeviceChild<MTLD3D12Fence> {
   D3D12_FENCE_FLAGS flags_;
@@ -159,6 +165,7 @@ public:
   HRESULT
   Initialize(UINT64 InitialValue) {
     auto &event = completion_->event;
+#ifdef _WIN32
     if (!event && (flags_ & (D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER))) {
       if (!(event = device_->GetMTLDevice().newSharedEvent()))
         return E_OUTOFMEMORY;
@@ -166,6 +173,12 @@ public:
       if (!shareEvent(event, mach_port_name_))
         return E_FAIL;
     }
+#else
+    // Native SHARED fences keep queue synchronization within this process.
+    // The native API cannot export a fence or share it across adapters.
+    if (flags_ & D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER)
+      return E_NOTIMPL;
+#endif
     // an opened fence has the value of the fence it opens, a created one its initial value
     completion_->value = event ? event.signaledValue() : InitialValue;
     std::lock_guard lock(device_->fences.mutex);
@@ -184,7 +197,11 @@ public:
 
   HRESULT
   CreateSharedHandle(const SECURITY_ATTRIBUTES *attributes, const WCHAR *name, HANDLE *handle) override {
+#ifdef _WIN32
     return mach_port_name_[0] ? shareHandle(mach_port_name_, attributes, name, handle) : E_INVALIDARG;
+#else
+    return E_NOTIMPL;
+#endif
   }
 
   ULONG STDMETHODCALLTYPE

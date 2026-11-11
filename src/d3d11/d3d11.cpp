@@ -29,7 +29,9 @@
 #include <exception>
 
 namespace mullion {
+#ifndef MULLION_NATIVE
 Logger Logger::s_instance("d3d11.log");
+#endif
 
 D3D_FEATURE_LEVEL
 GetMaxFeatureLevel(WMT::Device device) {

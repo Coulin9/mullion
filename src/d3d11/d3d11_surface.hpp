@@ -13,6 +13,7 @@ namespace mullion {
 class MTLD3D11Surface final : public ComObject<IDXGISurface2> {
 public:
   struct GDIState {
+#ifdef _WIN32
     mullion::mutex mutex;
     HDC dc = nullptr;
     HGDIOBJ old = nullptr;
@@ -24,6 +25,7 @@ public:
         DeleteDC(dc);
       }
     }
+#endif
   };
 
   MTLD3D11Surface(
@@ -129,6 +131,7 @@ public:
   // merger no longer renders to it)
   HRESULT STDMETHODCALLTYPE
   GetDC(BOOL Discard, HDC *phdc) final {
+#ifdef _WIN32
     if (!phdc)
       return E_INVALIDARG;
     if (!gdi_)
@@ -194,10 +197,14 @@ public:
     gdi_->dc = dc;
     *phdc = dc;
     return S_OK;
+#else
+    return DXGI_ERROR_UNSUPPORTED;
+#endif
   }
 
   HRESULT STDMETHODCALLTYPE
   ReleaseDC(RECT *pDirtyRect) final {
+#ifdef _WIN32
     if (!gdi_)
       return DXGI_ERROR_INVALID_CALL;
     std::lock_guard lock(gdi_->mutex);
@@ -218,6 +225,9 @@ public:
     DeleteDC(gdi_->dc);
     gdi_->dc = nullptr;
     return S_OK;
+#else
+    return DXGI_ERROR_UNSUPPORTED;
+#endif
   }
 
   HRESULT STDMETHODCALLTYPE

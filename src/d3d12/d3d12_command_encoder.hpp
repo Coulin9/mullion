@@ -109,6 +109,8 @@ struct RenderEncoderStencilAttachmentData {
 
 struct RenderEncoderData : EncoderData {
   EncoderData *previous;
+  // A color render pass in the same list whose fence can be waited before fragment work.
+  const EncoderData *fragment_wait_after = nullptr;
   std::array<RenderEncoderColorAttachmentData, 8> colors;
   RenderEncoderDepthAttachmentData depth;
   RenderEncoderStencilAttachmentData stencil;

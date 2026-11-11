@@ -1,6 +1,8 @@
 #include "dxgi_interfaces.h"
+#ifdef _WIN32
 #include "dxgi_ngx_certificate.h"
 #include <wincrypt.h>
+#endif
 #include "log/log.hpp"
 #include "util_env.hpp"
 #include "config/config.hpp"
@@ -10,7 +12,9 @@
 #include <utility>
 
 namespace mullion {
+#ifndef MULLION_NATIVE
 Logger Logger::s_instance("dxgi.log");
+#endif
 
 VendorExtension g_extension_enabled = VendorExtension::None;
 

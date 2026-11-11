@@ -27,6 +27,11 @@
 #include "util_flags.hpp"
 #include "util_svector.hpp"
 
+#ifdef MULLION_NATIVE
+#include <windows_base.h>
+struct dxn_shared_texture;
+#endif
+
 namespace mullion {
 
 enum class TextureAllocationFlag : uint32_t {
@@ -155,7 +160,7 @@ public:
 private:
   TextureAllocation(
       Texture *descriptor, WMT::Reference<WMT::Buffer> &&buffer, void *mapped_buffer, const WMTTextureInfo &info,
-      unsigned bytes_per_row, Flags<TextureAllocationFlag> flags
+      unsigned bytes_per_row, Flags<TextureAllocationFlag> flags, uint64_t offset = 0
   );
   TextureAllocation(
       Texture *descriptor, WMT::Reference<WMT::Texture> &&texture, const WMTTextureInfo &textureDescriptor,
@@ -300,6 +305,11 @@ public:
 
   Rc<TextureAllocation> allocate(Flags<TextureAllocationFlag> flags);
   Rc<TextureAllocation> allocate(Flags<TextureAllocationFlag> flags, WMT::Heap heap, uint64_t heap_offset = 0);
+#ifdef MULLION_NATIVE
+  Rc<TextureAllocation> allocateFromBuffer(
+      WMT::Reference<WMT::Buffer> &&buffer, void *memory, uint64_t offset, Flags<TextureAllocationFlag> flags
+  );
+#endif
   Rc<TextureAllocation> import(mach_port_t mach_port);
   // an allocation of a Metal texture another API made, of this texture's description (D3D11On12's wrapped resources)
   Rc<TextureAllocation> wrap(WMT::Reference<WMT::Texture> &&texture, const WMTTextureInfo &info, Flags<TextureAllocationFlag> flags);
@@ -332,6 +342,15 @@ private:
   mullion::shared_mutex mutex_;
   WMT::Device device_;
 };
+
+#ifdef MULLION_NATIVE
+// On success descriptor owns a new fd and storage owns the mapped pages.
+// A source descriptor supplies a borrowed fd and the producer's layout.
+HRESULT AllocateNativeLinearTexture(
+    WMT::Device device, WMTTextureInfo info, uint32_t bytes_per_texel, Flags<TextureAllocationFlag> flags,
+    const dxn_shared_texture *source, dxn_shared_texture &descriptor, Rc<Texture> &storage
+);
+#endif
 
 class RenamableTexturePool {
 public:

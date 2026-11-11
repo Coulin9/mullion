@@ -41,6 +41,9 @@
 #include <limits>
 #include "d3d10_1.h"
 #include "d3d11_4.h"
+#ifdef MULLION_NATIVE
+#include <directx-native/dxn_shared.h>
+#endif
 
 namespace mullion {
 
@@ -1541,8 +1544,15 @@ public:
       D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE *OptimizedClearValue, REFIID riid, void **ppResource
   ) {
     InitReturnPtr(ppResource);
-    HRESULT hr = S_OK;
-    hr = ValidateHeapProperties(pHeapProps, HeapFlags, advertise_numa_);
+    auto validated_flags = HeapFlags;
+#ifdef MULLION_NATIVE
+    if (uint32_t(HeapFlags) & DXN_MISC_LINEAR_EXPORT) {
+      if (!pDesc || pDesc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !(HeapFlags & D3D12_HEAP_FLAG_SHARED))
+        return E_INVALIDARG;
+      validated_flags = D3D12_HEAP_FLAGS(uint32_t(HeapFlags) & ~DXN_MISC_LINEAR_EXPORT);
+    }
+#endif
+    HRESULT hr = ValidateHeapProperties(pHeapProps, validated_flags, advertise_numa_);
     if (FAILED(hr))
       return hr;
     hr = ValidateResourceDescs(pDesc, pHeapProps);
@@ -1663,9 +1673,14 @@ public:
       ID3D12DeviceChild *object, const SECURITY_ATTRIBUTES *attributes, DWORD access, const WCHAR *name, HANDLE *handle
   ) {
     InitReturnPtr(handle);
-    Com<ID3D12Fence> fence;
     if (!object || !handle)
       return E_INVALIDARG;
+#ifdef MULLION_NATIVE
+    if (name || attributes || access != GENERIC_ALL)
+      return E_INVALIDARG;
+    return ExportSharedTexture(this, object, handle);
+#else
+    Com<ID3D12Fence> fence;
     // only fences are shared so far, not resources and heaps
     if (FAILED(object->QueryInterface(IID_PPV_ARGS(&fence))))
       return E_NOTIMPL;
@@ -1673,21 +1688,32 @@ public:
     if (access != GENERIC_ALL)
       return E_INVALIDARG;
     return static_cast<MTLD3D12Fence *>(fence.ptr())->CreateSharedHandle(attributes, name, handle);
+#endif
   };
 
   HRESULT STDMETHODCALLTYPE
   OpenSharedHandle(HANDLE handle, REFIID riid, void **object) {
     InitReturnPtr(object);
+#ifdef MULLION_NATIVE
+    if (riid != __uuidof(ID3D12Resource) && riid != __uuidof(ID3D12Resource1) && riid != __uuidof(ID3D12Resource2))
+      return E_NOTIMPL;
+    return OpenSharedTexture(this, handle, riid, object);
+#else
     char mach_port_name[54];
     auto event = openSharedEvent(GetMTLDevice(), handle, mach_port_name);
     return OpenFence(this, std::move(event), mach_port_name, riid, object);
+#endif
   };
 
   HRESULT STDMETHODCALLTYPE
   OpenSharedHandleByName(const WCHAR *name, DWORD access, HANDLE *handle) {
     InitReturnPtr(handle);
+#ifdef MULLION_NATIVE
+    return E_NOTIMPL;
+#else
     // "Currently the only value this parameter accepts is GENERIC_ALL" (OpenSharedHandleByName, Access)
     return name && handle && access == GENERIC_ALL ? openHandleByName(name, access, handle) : E_INVALIDARG;
+#endif
   };
 
   HRESULT STDMETHODCALLTYPE

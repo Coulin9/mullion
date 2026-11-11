@@ -248,17 +248,30 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   // what orders the passes (EncoderData::overlap): events that order work without a pass of their own (barriers,
   // queries, predication, stream output) so far; the last pass a draw or dispatch began, and how many such events
   // there had been then; and what render passes drew to since the last ordering point
-  uint64_t order_serial_ = 0, plain_serial_ = 0;
+  uint64_t order_serial_ = 0, full_order_serial_ = 0, plain_serial_ = 0;
   const EncoderData *plain_pass_ = nullptr;
   std::vector<const Texture *> overlap_targets_;
 
   // work after this point waits for work before it: the open pass too, which barriers that do not end it (Order),
   // queries and stream output leave open, and whose later draws or dispatches may read what passes before it wrote
   void
-  OrderingPoint() {
+  MarkOrderingPoint() {
     order_serial_++;
     if (allocator_->encoder_current)
       allocator_->encoder_current->overlap = PassOverlap::Ordered;
+  }
+
+  void
+  RequireFullOrder() {
+    full_order_serial_ = order_serial_;
+    if (auto pass = allocator_->encoder_current; pass && pass->type == EncoderType::Render)
+      static_cast<RenderEncoderData *>(pass)->fragment_wait_after = nullptr;
+  }
+
+  void
+  OrderingPoint() {
+    MarkOrderingPoint();
+    RequireFullOrder();
   }
 
   // the overlap of a pass a draw or dispatch just began, after the passes before it are in the list
@@ -275,6 +288,9 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
       return texture && std::ranges::find(overlap_targets_, texture) != overlap_targets_.end();
     });
     pass->overlap = !follows ? PassOverlap::Ordered : shared ? PassOverlap::Shared : PassOverlap::Independent;
+    if (pass->type == EncoderType::Render && plain_pass_ && allocator_->encoder_last == plain_pass_ &&
+        plain_pass_->type == EncoderType::Render && full_order_serial_ <= plain_serial_ && plain_serial_ < order_serial_)
+      static_cast<RenderEncoderData *>(pass)->fragment_wait_after = plain_pass_;
     for (auto texture : targets)
       if (texture)
         overlap_targets_.push_back(texture);
@@ -787,6 +803,7 @@ public:
     markers_.clear();
     plain_pass_ = nullptr;
     order_serial_ = 0;
+    full_order_serial_ = 0;
     overlap_targets_.clear();
     named_.clear();
     hoisted_ = nullptr;
@@ -1095,7 +1112,7 @@ public:
   }
 
   DrawCallStatus
-  PreDraw(bool SkipResourceBinding = false) {
+  PreDraw(bool SkipResourceBinding = false, bool DirectNonIndexed = false) {
     // a sampler that needs what the pipeline leaves out may have come since it was set (MTLD3D12PipelineState::left_out)
     while (pso_graphics_ && (pso_graphics_->left_out & device_->sampler_emulations)) {
       pso_graphics_ = static_cast<MTLD3D12GraphicsPipelineState *>(pso_graphics_->Fuller(device_));
@@ -1124,10 +1141,11 @@ public:
     }
     // a draw whose scissors or viewports the pass has no room for starts the next pass
     const UINT count = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    const UINT metal_viewport_count = pso_graphics_->viewport_array_index ? count : 1;
     if (auto pass = static_cast<RenderEncoderData *>(allocator_->encoder_current);
         allocator_->encoder_current && allocator_->encoder_current->type == EncoderType::Render &&
-        ((dirty_state_.test(DirtyState::ScissorRect) && pass->scissors + count > WMT::kPassRectangles) ||
-         (dirty_state_.test(DirtyState::Viewport) && pass->viewports + count > WMT::kPassRectangles) ||
+        ((dirty_state_.test(DirtyState::ScissorRect) && pass->scissors + metal_viewport_count > WMT::kPassRectangles) ||
+         (dirty_state_.test(DirtyState::Viewport) && pass->viewports + metal_viewport_count > WMT::kPassRectangles) ||
          (pass->rasterless && !pso_graphics_->rasterless)))
       allocator_->InvalidateCurrentPass();
     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Render) {
@@ -1232,6 +1250,14 @@ public:
       if (!active_queries_.empty())
         CountVisibility();
     }
+
+    auto render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
+    if (render->fragment_wait_after &&
+        (!DirectNonIndexed || !rootsig_graphics_ || !rootsig_graphics_->PixelOnlyResources ||
+         pso_graphics_->slot_mask || !pso_graphics_->pixel_shader || pso_graphics_->uses_uav ||
+         pso_graphics_->threads_per_patch || Geometry() || pso_graphics_->mesh_shader || pso_graphics_->conservative ||
+         pso_graphics_->stream_output || predication_region_ || !active_statistics_.empty() || coarse))
+      render->fragment_wait_after = nullptr;
 
     // the conservative rasterizer's viewports and state, bound again when they or the pipeline change
     bool conservative_dirty = dirty_state_.test(DirtyState::GraphicsPipelineState) || dirty_state_.test(DirtyState::Viewport);
@@ -1376,8 +1402,8 @@ public:
         auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_setviewports>();
         cmd.type = WMTRenderCommandSetViewports;
         cmd.viewports.set(metal_viewport);
-        cmd.viewport_count = count;
-        static_cast<RenderEncoderData *>(allocator_->encoder_current)->viewports += count;
+        cmd.viewport_count = metal_viewport_count;
+        static_cast<RenderEncoderData *>(allocator_->encoder_current)->viewports += metal_viewport_count;
       }
       EncodeBuffer(WMTRenderCommandSetVertexBuffer, scale_offset, SM50_BINDING_INDEX_RASTER_SCALE);
       EncodeBuffer(WMTRenderCommandSetMeshBuffer, scale_offset, SM50_BINDING_INDEX_RASTER_SCALE);
@@ -1411,7 +1437,7 @@ public:
       cmd.type = WMTRenderCommandSetScissorRects;
       cmd.scissor_rects.set(metal_scissors);
       // Metal takes as many scissors as it has viewports, or one, and it has one viewport until some are set
-      cmd.rect_count = num_viewports ? count : 1;
+      cmd.rect_count = num_viewports ? metal_viewport_count : 1;
       pass->scissors += cmd.rect_count;
       dirty_state_.clr(DirtyState::ScissorRect);
     }
@@ -1811,7 +1837,7 @@ public:
     uint32_t cp_count;
     if (!to_metal_primitive_type(topology_, primitive_type, cp_count))
       return;
-    DrawCallStatus status = PreDraw();
+    DrawCallStatus status = PreDraw(false, true);
     if (status == DrawCallStatus::Invalid)
       return;
     CountDraw(VertexCountPerInstance, InstanceCount);
@@ -2779,6 +2805,8 @@ public:
     auto graphics_pso = static_cast<MTLD3D12GraphicsPipelineState *>(pPSO);
     if (pso_graphics_.ptr() == graphics_pso)
       return;
+    if (!pso_graphics_ || pso_graphics_->viewport_array_index != graphics_pso->viewport_array_index)
+      dirty_state_.set(DirtyState::Viewport, DirtyState::ScissorRect);
     // tessellation, geometry shaders and stream output bind root arguments to other stages
     // and a pipeline whose mesh stage reads them, or reads the vertex buffers (mesh_only), to others again
     auto stages = [&](MTLD3D12GraphicsPipelineState *p) {
@@ -2845,7 +2873,30 @@ public:
 
   void STDMETHODCALLTYPE ResourceBarrier(UINT Count, const D3D12_RESOURCE_BARRIER *barriers) {
     WriteMarkers();
-    OrderingPoint();
+    auto open = allocator_->encoder_current;
+    bool fragment_only = Count && plain_pass_ && plain_pass_->type == EncoderType::Render &&
+                         (open ? open : allocator_->encoder_last) == plain_pass_ &&
+                         std::ranges::all_of(std::span(barriers, Count), [](const auto &barrier) {
+      if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || barrier.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE)
+        return false;
+      const auto &transition = barrier.Transition;
+      constexpr auto rt = D3D12_RESOURCE_STATE_RENDER_TARGET, ps = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+      if (!transition.pResource || transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES ||
+          !((transition.StateBefore == rt && transition.StateAfter == ps) ||
+            (transition.StateBefore == ps && transition.StateAfter == rt)))
+        return false;
+      const auto &texture = static_cast<MTLD3D12Resource *>(transition.pResource)->texture;
+      if (!texture || !texture->current())
+        return false;
+      auto flags = texture->current()->flags();
+      const auto &info = texture->info();
+      return info.type == WMTTextureType2D && !info.placement_sparse_page_size && !texture->render_buffer &&
+             flags.test(TextureAllocationFlag::GpuPrivate) &&
+             !flags.any(TextureAllocationFlag::AllocatedOnHeap, TextureAllocationFlag::Shared);
+    });
+    MarkOrderingPoint();
+    if (!fragment_only)
+      full_order_serial_ = order_serial_;
     constexpr auto uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS, draw_writes = uav | D3D12_RESOURCE_STATE_RENDER_TARGET |
                        D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_STREAM_OUT;
     // Metal orders passes that reach one memory through a reserved buffer and through another resource only with
@@ -2891,6 +2942,10 @@ public:
       ordered = Order(other || ((states.StateBefore & draw_writes) && PassWrote(states.pResource)),
                       other || ((states.StateBefore | states.StateAfter) & uav));
     }
+    // A barrier ending this encoder only orders later passes. When it leaves the encoder open, later draws may
+    // need an earlier wait than the draws recorded before the barrier did.
+    if (open && allocator_->encoder_current == open)
+      RequireFullOrder();
   };
 
   void STDMETHODCALLTYPE

@@ -46,7 +46,9 @@ __CRT_UUID_DECL(ID3D12SDKConfiguration, 0xe9eb5314, 0x33aa, 0x42b2, 0xa7, 0x18, 
 
 namespace mullion {
 
+#ifndef MULLION_NATIVE
 Logger Logger::s_instance("d3d12.log");
+#endif
 
 extern "C" HRESULT WINAPI
 D3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid, void **ppDevice) {
@@ -241,6 +243,7 @@ D3D12EnableExperimentalFeatures(UINT NumFeatures, const IID *pIIDs, void *pConfi
   return S_OK;
 }
 
+#ifdef _WIN32
 BOOL WINAPI
 DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
   if (reason != DLL_PROCESS_ATTACH)
@@ -249,5 +252,6 @@ DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
   DisableThreadLibraryCalls(instance);
   return TRUE;
 }
+#endif
 
 } // namespace mullion

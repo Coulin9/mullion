@@ -27,11 +27,11 @@ namespace mullion {
 namespace {
 
 // the name a library's function exports under: "name" of the C++ mangling "\x01?name@@..."
-std::wstring
+str::wide_string
 ExportName(std::string_view function) {
   if (function.starts_with("\x01?"))
     function = function.substr(2, function.find("@@") - 2);
-  return std::wstring(function.begin(), function.end());
+  return str::wide_string(function.begin(), function.end());
 }
 
 struct RayLibrary {
@@ -86,7 +86,7 @@ ReadSubobjects(const D3D12_SHADER_BYTECODE &library) {
   }
   // a string is its offset in the string part
   auto string = [&](uint32_t offset) {
-    std::wstring name;
+    str::wide_string name;
     for (auto at = offset; at < parts[Strings].size() && parts[Strings][at]; at++)
       name.push_back(parts[Strings][at]);
     return name;
@@ -144,7 +144,7 @@ namespace {
 
 // a hit group: its name, and the names of its closest hit, any hit and intersection shaders, empty for none
 struct HitGroup {
-  std::wstring name, imports[3];
+  str::wide_string name, imports[3];
 };
 
 // how an association of a subobject with exports was made, the weakest first ("Subobject association behavior"):
@@ -159,12 +159,12 @@ struct Association {
   ID3D12RootSignature *root;
   Strength strength;
   // the export, or none for every export of the scope
-  std::wstring name;
+  str::wide_string name;
   // the scopes of one without an export: the library whose subobjects made it, and the collection it was made in
   const RayLibrary *library;
   const void *collection;
   // an unresolved library subobject (DXR "Explicit associations": the subobject need not "be visible yet")
-  std::wstring subobject;
+  str::wide_string subobject;
   std::pair<uint32_t, uint32_t> values{};
 };
 
@@ -266,8 +266,8 @@ class MTLD3D12StateObjectImpl : public MTLD3D12DeviceChild<MTLD3D12StateObject, 
   D3D12_STATE_OBJECT_TYPE type_ = D3D12_STATE_OBJECT_TYPE_COLLECTION;
   uint32_t flags_ = 0;
   // every shader the state object has seen, by name, for the hit groups that import them
-  std::unordered_map<std::wstring, RayShader> shaders_;
-  std::unordered_map<std::wstring, RayExport> exports_;
+  std::unordered_map<str::wide_string, RayShader> shaders_;
+  std::unordered_map<str::wide_string, RayExport> exports_;
   std::vector<Com<MTLD3D12RootSignature, false>> root_signatures_;
   D3D12_RAYTRACING_PIPELINE_CONFIG1 pipeline_config_{};
   std::optional<std::pair<uint32_t, uint32_t>> configurations_[SubobjectKinds - ShaderConfig];
@@ -281,8 +281,8 @@ class MTLD3D12StateObjectImpl : public MTLD3D12DeviceChild<MTLD3D12StateObject, 
   std::vector<Association> deferred_associations_;
   // the libraries' definitions by their subobjects' names, and the names of all their subobjects: an association
   // may name one of another scope
-  std::unordered_map<std::wstring, Association> library_definitions_;
-  std::unordered_set<std::wstring> library_names_;
+  std::unordered_map<str::wide_string, Association> library_definitions_;
+  std::unordered_set<str::wide_string> library_names_;
 
   struct Pipeline {
     WMT::Reference<WMT::ComputePipelineState> pipeline;
@@ -296,17 +296,17 @@ class MTLD3D12StateObjectImpl : public MTLD3D12DeviceChild<MTLD3D12StateObject, 
   template <typename Value>
   static void
   Export(
-      const std::unordered_map<std::wstring, Value> &all, std::span<const D3D12_EXPORT_DESC> exports,
-      std::unordered_map<std::wstring, Value> &out
+      const std::unordered_map<str::wide_string, Value> &all, std::span<const D3D12_EXPORT_DESC> exports,
+      std::unordered_map<str::wide_string, Value> &out
   ) {
     if (exports.empty())
       out.insert(all.begin(), all.end());
     for (auto &desc : exports) {
-      std::wstring name = desc.Name;
+      str::wide_string name = desc.Name;
       // a mangled name exports as the function it mangles
       auto found = all.find(ExportName(std::string(name.begin(), name.end())));
       if (desc.ExportToRename) {
-        std::wstring source = desc.ExportToRename;
+        str::wide_string source = desc.ExportToRename;
         found = all.find(ExportName(std::string(source.begin(), source.end())));
       } else {
         name = found == all.end() ? name : found->first;
@@ -333,7 +333,7 @@ class MTLD3D12StateObjectImpl : public MTLD3D12DeviceChild<MTLD3D12StateObject, 
       ERR("CreateStateObject: a DXIL library is not usable: ", SM50GetErrorMessageString(error));
       return E_INVALIDARG;
     }
-    std::unordered_map<std::wstring, RayShader> shaders;
+    std::unordered_map<str::wide_string, RayShader> shaders;
     char name[1024];
     SM50_RAY_SHADER_INFO info;
     for (uint32_t i = 0; SM50GetRayShader(library->shader, i, name, sizeof(name), &info); i++)
@@ -540,7 +540,7 @@ public:
             root_signatures_.end(), collection->root_signatures_.begin(), collection->root_signatures_.end()
         );
         // what it left for this state object: its hit groups, as the exports take them, and its associations
-        std::unordered_map<std::wstring, HitGroup> groups, taken;
+        std::unordered_map<str::wide_string, HitGroup> groups, taken;
         for (auto &group : collection->deferred_hit_groups_)
           groups[group.name] = group;
         Export(groups, {desc.pExports, desc.NumExports}, taken);
@@ -564,7 +564,7 @@ public:
       }
       case D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP: {
         auto &group = *(const D3D12_HIT_GROUP_DESC *)subobject.pDesc;
-        auto name = [](const WCHAR *import) { return std::wstring(import ? import : L""); };
+        auto name = [](const WCHAR *import) { return str::wide_string(import ? import : MULLION_WIDE("")); };
         hit_groups.push_back(
             {group.HitGroupExport,
              {name(group.ClosestHitShaderImport), name(group.AnyHitShaderImport), name(group.IntersectionShaderImport)}}
@@ -639,7 +639,7 @@ public:
     }
     // an association of a library's subobject: one of a library's own (`library`), or the state object's. a
     // subobject no library defines here waits under its name
-    auto associate = [&](const RayLibrary *library, const std::wstring &name, std::span<const std::wstring> exports) {
+    auto associate = [&](const RayLibrary *library, const str::wide_string &name, std::span<const str::wide_string> exports) {
       auto found = library_definitions.find(name);
       if (found == library_definitions.end() && library_names_.count(name))
         return;
@@ -656,7 +656,7 @@ public:
         associations.push_back(made);
       }
     };
-    std::unordered_set<std::wstring> library_associated;
+    std::unordered_set<str::wide_string> library_associated;
     for (auto &[library, subobject] : library_subobjects)
       if (subobject.type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION) {
         associate(library, subobject.names[0], std::span(subobject.names).subspan(1));
@@ -669,7 +669,7 @@ public:
     for (auto &subobject : subobjects)
       if (subobject.Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION) {
         auto &association = *(const D3D12_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION *)subobject.pDesc;
-        std::vector<std::wstring> exports(association.pExports, association.pExports + association.NumExports);
+        std::vector<str::wide_string> exports(association.pExports, association.pExports + association.NumExports);
         associate(nullptr, association.SubobjectToAssociate, exports);
       }
     // DXR "Explicit associations": an executable state object needs both ends of an association resolved
@@ -713,7 +713,7 @@ public:
     // state object's associations "do not override any existing associations in contained collections". one of its
     // own that names the shader is a conflict with one of the collection's that does, and stands where the
     // collection gave the shader only a default
-    auto resolve = [&](SubobjectKind of, const std::wstring &name, const RayShader &shader, const std::wstring *group) {
+    auto resolve = [&](SubobjectKind of, const str::wide_string &name, const RayShader &shader, const str::wide_string *group) {
       auto source = ExportName(shader.function);
       const Association *best[2] = {};
       auto applies = [&](const Association &a) {
@@ -757,7 +757,7 @@ public:
       }
       return outer->name.empty() ? inner : outer;
     };
-    auto validate = [&](const std::wstring &name, const RayShader &shader, const std::wstring *group, bool inherited) {
+    auto validate = [&](const str::wide_string &name, const RayShader &shader, const str::wide_string *group, bool inherited) {
       // DXR "Subobject association requirements": shader and pipeline configs are required and matching for all exports
       for (unsigned of = ShaderConfig; of < SubobjectKinds; of++) {
         auto config = resolve((SubobjectKind)of, name, shader, group);
@@ -778,7 +778,7 @@ public:
     std::map<std::tuple<sm50_shader_t, std::string, ID3D12RootSignature *, ID3D12RootSignature *>,
              std::shared_ptr<RayFunction>>
         compiled;
-    auto function = [&](RayExport &to, unsigned index, const std::wstring &name, const std::wstring *group) {
+    auto function = [&](RayExport &to, unsigned index, const str::wide_string &name, const str::wide_string *group) {
       auto shader = shaders_.find(name);
       if (shader == shaders_.end()) {
         if (!deferred_) {
@@ -913,13 +913,13 @@ public:
   // itself has no size, nor has another shader a part
   UINT64 STDMETHODCALLTYPE
   GetShaderStackSize(const WCHAR *pExportName) {
-    std::wstring name = pExportName;
+    str::wide_string name = pExportName;
     unsigned index = 0;
-    auto at = name.find(L"::");
-    bool part = at != std::wstring::npos;
+    auto at = name.find(MULLION_WIDE("::"));
+    bool part = at != str::wide_string::npos;
     if (part) {
-      const std::wstring_view parts[] = {L"closesthit", L"anyhit", L"intersection"};
-      index = std::find(std::begin(parts), std::end(parts), std::wstring_view(name).substr(at + 2)) - parts;
+      const str::wide_string_view parts[] = {MULLION_WIDE("closesthit"), MULLION_WIDE("anyhit"), MULLION_WIDE("intersection")};
+      index = std::find(std::begin(parts), std::end(parts), str::wide_string_view(name).substr(at + 2)) - parts;
       name.resize(at);
     }
     auto found = exports_.find(name);

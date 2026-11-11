@@ -5,6 +5,7 @@
 #include "thread.hpp"
 #include "log/log.hpp"
 #include "log/trace.hpp"
+#include "util_win32_compat.h"
 #include <algorithm>
 #include <atomic>
 #include <string_view>

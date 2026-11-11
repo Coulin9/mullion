@@ -22,6 +22,17 @@
 #include "mullion_format.hpp"
 #include "com/com_pointer.hpp"
 
+#ifdef MULLION_NATIVE
+#include <d3d11.h>
+#include <directx-native/dxn_shared.h>
+#include <cerrno>
+#include <fcntl.h>
+#include <mutex>
+#include <new>
+#include <unordered_set>
+#include <unistd.h>
+#endif
+
 namespace mullion {
 
 // the size D3D12 estimates a texture's most-detailed mip level of one slice at, for 4KB alignment: its width and height
@@ -273,6 +284,28 @@ WithinSlices(UINT first, UINT count, UINT length) {
   return first < length && count <= length - first;
 }
 
+#ifdef MULLION_NATIVE
+namespace {
+
+std::mutex shared_handles_mutex;
+std::unordered_set<dxn_shared_texture *> shared_handles;
+
+} // namespace
+
+extern "C" int
+mullion_shared_handle_close(void *handle) {
+  auto *texture = static_cast<dxn_shared_texture *>(handle);
+  {
+    std::lock_guard lock(shared_handles_mutex);
+    if (!shared_handles.erase(texture))
+      return -EINVAL;
+  }
+  close(texture->fd);
+  delete texture;
+  return 0;
+}
+#endif
+
 class MTLD3D12Texture : public MTLD3D12Pageable<MTLD3D12Resource> {
   D3D12_RESOURCE_DESC desc_;
   D3D12_HEAP_PROPERTIES heap_props_;
@@ -282,6 +315,44 @@ class MTLD3D12Texture : public MTLD3D12Pageable<MTLD3D12Resource> {
   // ("A placed resource object holds a reference on the heap it is created on", ID3D12Device::CreateHeap)
   Com<MTLD3D12Heap, false> heap_;
 
+#ifdef MULLION_NATIVE
+  dxn_shared_texture shared_ = {.fd = -1};
+
+  HRESULT
+  InitializeLinearTexture(WMTTextureInfo info, const dxn_shared_texture *source) {
+    if (info.type != WMTTextureType2D || info.sample_count != 1 || info.mipmap_level_count != 1 ||
+        !info.width || !info.height || desc_.Width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+        desc_.Height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION || desc_.SampleDesc.Quality ||
+        (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+      return E_INVALIDARG;
+
+    auto device = device_->GetMTLDevice();
+    MTL_DXGI_FORMAT_DESC format;
+    if (FAILED(MTLQueryDXGIFormat(device, desc_.Format, format)) || !format.BytesPerTexel ||
+        (format.Flag & (MTL_DXGI_FORMAT_BC | MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER |
+                        MTL_DXGI_FORMAT_VIDEO_PLANAR | MTL_DXGI_FORMAT_EMULATED_RGB32)))
+      return E_INVALIDARG;
+
+    Rc<Texture> storage;
+    Flags<TextureAllocationFlag> flags = {};
+    HRESULT hr = AllocateNativeLinearTexture(device, info, format.BytesPerTexel, flags, source, shared_, storage);
+    if (FAILED(hr))
+      return hr;
+
+    shared_.meta.dxgi_format = desc_.Format;
+    if (!(desc_.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+      shared_.meta.bind_flags |= D3D11_BIND_SHADER_RESOURCE;
+    if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+      shared_.meta.bind_flags |= D3D11_BIND_RENDER_TARGET;
+    if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+      shared_.meta.bind_flags |= D3D11_BIND_UNORDERED_ACCESS;
+    shared_.meta.misc_flags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    device_->RegisterResidency(storage->current()->texture());
+    texture = std::move(storage);
+    return S_OK;
+  }
+#endif
+
 public:
   MTLD3D12Texture(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12Resource>(pDevice) {}
 
@@ -290,6 +361,9 @@ public:
       const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS HeapFlags, const D3D12_RESOURCE_DESC *pDesc,
       D3D12_RESOURCE_STATES InitialState, MTLD3D12Heap *pHeap, UINT64 HeapOffset, bool Reserved = false,
       const MullionMetalResource *pTexture = nullptr
+#ifdef MULLION_NATIVE
+      , const dxn_shared_texture *shared_import = nullptr
+#endif
   ) {
     // TODO: validate and normalize
     desc_ = *pDesc;
@@ -336,6 +410,16 @@ public:
       desc_.Alignment = desc_.SampleDesc.Count > 1 ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
                                                    : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
     }
+
+#ifdef MULLION_NATIVE
+    if (uint32_t(HeapFlags) & DXN_MISC_LINEAR_EXPORT) {
+      heap_flags_ = D3D12_HEAP_FLAGS(uint32_t(HeapFlags) & ~DXN_MISC_LINEAR_EXPORT);
+      if (pHeap || Reserved || pTexture || !(heap_flags_ & D3D12_HEAP_FLAG_SHARED) ||
+          desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+        return E_INVALIDARG;
+      return InitializeLinearTexture(texture_info, shared_import);
+    }
+#endif
 
     MTL_DXGI_FORMAT_DESC format;
     MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, format);
@@ -397,10 +481,40 @@ public:
   };
 
   ~MTLD3D12Texture() {
+#ifdef MULLION_NATIVE
+    if (shared_.fd >= 0)
+      close(shared_.fd);
+#endif
     for (auto storage = texture.ptr(); storage; storage = storage->chroma.ptr())
       if (storage->current() && !storage->current()->flags().test(TextureAllocationFlag::AllocatedOnHeap))
         device_->UnregisterResidency(storage->current()->texture());
   }
+
+#ifdef MULLION_NATIVE
+  HRESULT
+  ExportSharedHandle(HANDLE *handle) {
+    if (shared_.fd < 0)
+      return E_NOTIMPL;
+    auto *descriptor = new (std::nothrow) dxn_shared_texture(shared_);
+    if (!descriptor)
+      return E_OUTOFMEMORY;
+    descriptor->fd = fcntl(shared_.fd, F_DUPFD_CLOEXEC, 0);
+    if (descriptor->fd < 0) {
+      delete descriptor;
+      return E_FAIL;
+    }
+    try {
+      std::lock_guard lock(shared_handles_mutex);
+      shared_handles.insert(descriptor);
+    } catch (const std::bad_alloc &) {
+      close(descriptor->fd);
+      delete descriptor;
+      return E_OUTOFMEMORY;
+    }
+    *handle = descriptor;
+    return S_OK;
+  }
+#endif
 
   HRESULT
   STDMETHODCALLTYPE
@@ -1265,6 +1379,54 @@ public:
     return count;
   }
 };
+
+#ifdef MULLION_NATIVE
+HRESULT
+ExportSharedTexture(MTLD3D12Device *device, ID3D12DeviceChild *object, HANDLE *handle) {
+  Com<ID3D12Resource> resource;
+  if (FAILED(object->QueryInterface(IID_PPV_ARGS(&resource))))
+    return E_NOTIMPL;
+  Com<ID3D12Device> owner;
+  if (FAILED(resource->GetDevice(IID_PPV_ARGS(&owner))) || owner.ptr() != static_cast<ID3D12Device *>(device))
+    return E_INVALIDARG;
+  if (resource->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+    return E_NOTIMPL;
+  return static_cast<MTLD3D12Texture *>(resource.ptr())->ExportSharedHandle(handle);
+}
+
+HRESULT
+OpenSharedTexture(MTLD3D12Device *device, HANDLE handle, REFIID riid, void **object) {
+  auto *source = static_cast<const dxn_shared_texture *>(handle);
+  if (!object || !dxn_shared_check(source, DXN_SHARED_TEXTURE_MAGIC, sizeof(*source)) ||
+      source->fd < 0 || source->drm_modifier || source->plane_count != 1 ||
+      source->meta.mip_levels != 1 || source->meta.array_size != 1 || source->meta.sample_count != 1 ||
+      source->meta.sample_quality || (source->meta.bind_flags & D3D11_BIND_DEPTH_STENCIL))
+    return E_INVALIDARG;
+
+  D3D12_RESOURCE_DESC desc{};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = source->meta.width;
+  desc.Height = source->meta.height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = DXGI_FORMAT(source->meta.dxgi_format);
+  desc.SampleDesc.Count = 1;
+  if (source->meta.bind_flags & D3D11_BIND_RENDER_TARGET)
+    desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  if (source->meta.bind_flags & D3D11_BIND_UNORDERED_ACCESS)
+    desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  if (!(source->meta.bind_flags & D3D11_BIND_SHADER_RESOURCE))
+    desc.Flags |= D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+
+  D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+  auto texture = Com(new MTLD3D12Texture(device));
+  HRESULT hr = texture->Initialize(&heap, D3D12_HEAP_FLAGS(D3D12_HEAP_FLAG_SHARED | DXN_MISC_LINEAR_EXPORT),
+                                   &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, 0, false, nullptr, source);
+  if (FAILED(hr))
+    return hr;
+  return texture->QueryInterface(riid, object);
+}
+#endif
 
 HRESULT
 CreateCommittedTexture(

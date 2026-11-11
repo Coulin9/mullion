@@ -11,7 +11,8 @@ dxgi_src = [
 dxgi_ld_args      = ['-L' + windows_native_install_dir] # a nice trick to force relink
 dxgi_link_depends = []
 
-dxgi_dll = shared_library('dxgi', dxgi_src, dxgi_res,
+if mullion_crossbuild
+dxgi_lib = shared_library('dxgi', dxgi_src, dxgi_res,
   name_prefix         : '',
   dependencies        : [ mullion_dep, util_dep, winemetal_dep ],
   include_directories : [ mullion_include_path ],
@@ -21,18 +22,24 @@ dxgi_dll = shared_library('dxgi', dxgi_src, dxgi_res,
   link_args           : dxgi_ld_args,
   link_depends        : [ dxgi_link_depends ],
 )
+else
+dxgi_lib = static_library('dxgi', dxgi_src,
+  dependencies        : [ mullion_dep, util_dep, winemetal_dep ],
+  include_directories : [ mullion_include_path ],
+)
+endif
 
 dxgi_dep = declare_dependency(
-  link_with           : [ dxgi_dll ],
+  link_with           : [ dxgi_lib ],
   include_directories : [ mullion_include_path, include_directories('.') ],
 )
 
 if wine_builtin_dll
 custom_target('postprocess_libdxgi',
-  input : dxgi_dll,
+  input : dxgi_lib,
   output: 'dxgi.dll.postproc',
   command : [ winebuild, '--builtin', '@INPUT@' ],
-  depends : dxgi_dll,
+  depends : dxgi_lib,
   build_by_default : true
 )
 endif

@@ -12,8 +12,12 @@
 #include "dxgi_object.hpp"
 #include "d3d10_1.h"
 #include "Metal.hpp"
+#include "util_win32_compat.h"
 
 namespace mullion {
+
+static_assert(sizeof(WCHAR) == 2);
+static_assert(sizeof(DXGI_ADAPTER_DESC) == 304 && offsetof(DXGI_ADAPTER_DESC, VendorId) == 256);
 
 const GUID kWineDXGIAdapterUUID = {0x17399d75,
                                    0x964e,
