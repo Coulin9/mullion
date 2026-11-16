@@ -16,6 +16,7 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include <bit>
 #include <functional>
 #include "d3d12_command_allocator.hpp"
 #include "d3d12_acceleration_structure.hpp"
@@ -460,7 +461,7 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
       draw.threads = draw.step == 1 ? device_->GetSIMDWidth() : 1;
     if (predication_region_)
       draw.skips = allocator_->gpu_heap_buffer_address_ +
-                   (reinterpret_cast<char *>(predication_region_ + 3) - static_cast<char *>(allocator_->gpu_heap_));
+                   (reinterpret_cast<char *>(&predication_region_->skips) - static_cast<char *>(allocator_->gpu_heap_));
     auto [result, result_offset] =
         allocator_->AllocateGPUHeap(sizeof(PipelineStatisticsResult), alignof(PipelineStatisticsResult));
     if (allocator_->records_)
@@ -483,7 +484,7 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
     vertices *= instances;
     if (predication_region_) {
       auto skips = allocator_->gpu_heap_buffer_address_ +
-                   (reinterpret_cast<char *>(predication_region_ + 3) - static_cast<char *>(allocator_->gpu_heap_));
+                   (reinterpret_cast<char *>(&predication_region_->skips) - static_cast<char *>(allocator_->gpu_heap_));
       predicated_statistics_.push_back({vertices, primitives, 0, skips});
       return;
     }
@@ -528,13 +529,25 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
     uint32_t word, value, skipped;
   };
   std::vector<PredicatedWord> predicated_;
-  uint32_t *predication_region_ = nullptr;
+  // a region's header, which its kernel reads (mullion_command.metal, PredicationRegion)
+  struct PredicationRegion {
+    uint32_t count, views, skip_if_zero, skips;
+    uint64_t entries;
+    MTLD3D12CommandAllocatorImpl::ArgumentsView view[MTLD3D12CommandAllocatorImpl::kArgumentsViews];
+  };
+  // the kernel's header has room for seven
+  static_assert(std::size(PredicationRegion{}.view) <= 7);
+  PredicationRegion *predication_region_ = nullptr;
   EncoderData *predication_pass_ = nullptr;
 
   void
   EndPredication() {
     if (!predication_region_)
       return;
+    // what says whether the region was skipped is a word of the region's as the others are
+    predicated_.push_back(
+        {uint32_t((reinterpret_cast<char *>(&predication_region_->skips) - static_cast<char *>(allocator_->gpu_heap_)) / 4), 0, 1}
+    );
     auto [mapped, offset] = allocator_->AllocateGPUHeap(predicated_.size() * sizeof(PredicatedWord), 4);
     if (allocator_->records_)
       allocator_->RecordGPUHeap(
@@ -542,8 +555,11 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
       );
     if (mapped)
       memcpy(mapped, predicated_.data(), predicated_.size() * sizeof(PredicatedWord));
-    predication_region_[0] = predicated_.size();
-    predication_region_[1] = offset / 4;
+    predication_region_->count = predicated_.size();
+    predication_region_->entries = allocator_->gpu_heap_buffer_address_ + offset;
+    // the list may have gone on in another buffer since the region began (MTLD3D12CommandAllocatorImpl::Allocate),
+    // and what reads a word reads it through the buffer the list was in then: the kernel writes it through each
+    predication_region_->views = allocator_->ArgumentsViews(predication_region_->view);
     predication_region_ = nullptr;
     predicated_.clear();
   }
@@ -560,7 +576,7 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
       allocator->InvalidateCurrentPass();
       predicate = allocator->AllocatePass<PredicateEncoderData>();
       predicate->type = EncoderType::Predicate;
-      predicate->skips = list->predication_region_ + 3;
+      predicate->skips = &list->predication_region_->skips;
       allocator->InvalidateCurrentPass();
     }
 
@@ -1546,9 +1562,11 @@ public:
     bound_.pass = nullptr;
   }
 
+  // binds the list's buffer over the arguments at an offset, or the earlier one an address was made in (`Earlier`,
+  // ArgumentsAt)
   void
-  EncodeBuffer(WMTRenderCommandType Type, uint64_t Offset, uint8_t Index) {
-    obj_handle_t buffer = allocator_->gpu_heap_buffer_;
+  EncodeBuffer(WMTRenderCommandType Type, uint64_t Offset, uint8_t Index, obj_handle_t Earlier = 0) {
+    obj_handle_t buffer = Earlier ? Earlier : obj_handle_t(allocator_->gpu_heap_buffer_);
     // each Set*Buffer is followed by its Set*BufferOffset (WMTRenderCommandType)
     unsigned stage = Type == WMTRenderCommandSetVertexBuffer     ? 0
                      : Type == WMTRenderCommandSetFragmentBuffer ? 1
@@ -1668,6 +1686,7 @@ public:
   // for each that only counts
   WMT::RenderPipelineState
   Pipeline(bool counting = false) {
+    pso_graphics_->WaitPipeline();
     bool strip = Strip(topology_);
     if (PassesAdjacency() || pso_graphics_->patches)
       return RenderTargets(pso_graphics_->TopologyPipeline(topology_, counting));
@@ -2012,6 +2031,10 @@ public:
     }
     if (!pso_compute_)
         return false;
+    // a pipeline whose Metal compile failed on a compile thread dispatches nothing
+    pso_compute_->WaitPipeline();
+    if (!pso_compute_->pso)
+      return false;
 
     if (dirty_state_.test(DirtyState::ComputePipelineState)) {
       auto &cmd_setpso = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
@@ -2078,7 +2101,7 @@ public:
     uint64_t threads = uint64_t(X) * Y * Z * group.width * group.height * group.depth;
     if (predication_region_ && !active_statistics_.empty()) {
       auto skips = allocator_->gpu_heap_buffer_address_ +
-                   (reinterpret_cast<char *>(predication_region_ + 3) - static_cast<char *>(allocator_->gpu_heap_));
+                   (reinterpret_cast<char *>(&predication_region_->skips) - static_cast<char *>(allocator_->gpu_heap_));
       predicated_statistics_.push_back({0, 0, threads, skips});
     } else {
       for (auto &[_, sum] : active_statistics_)
@@ -3793,6 +3816,31 @@ public:
       allocator_->InvalidateCurrentPass();
       return;
     }
+    // "Binary occlusion queries write 64-bits per query. The least significant bit is either 0 ... or 1 ... The rest
+    // of the bits are 0" (ID3D12GraphicsCommandList::ResolveQueryData), also of a query that counted its samples
+    if (Type == D3D12_QUERY_TYPE_BINARY_OCCLUSION) {
+      StartComputePass();
+      auto &cmd_setpso = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
+      cmd_setpso.type = WMTComputeCommandSetPSO;
+      cmd_setpso.pso = device_->binary_occlusion_resolve;
+      cmd_setpso.threadgroup_size = {1, 1, 1};
+      const std::pair<obj_handle_t, uint64_t> buffers[] = {
+          {heap->results, uint64_t(StartIndex) * heap->result_size},
+          {dst, AlignedDstBufferOffset},
+      };
+      for (uint8_t i = 0; i < std::size(buffers); i++) {
+        auto &cmd = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
+        cmd.type = WMTComputeCommandSetBuffer;
+        cmd.buffer = buffers[i].first;
+        cmd.offset = buffers[i].second;
+        cmd.index = i;
+      }
+      auto &cmd_dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
+      cmd_dispatch.type = WMTComputeCommandDispatch;
+      cmd_dispatch.size = {QueryCount, 1, 1};
+      allocator_->InvalidateCurrentPass();
+      return;
+    }
     PreBlit();
     auto &cmd = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
     cmd.type = WMTBlitCommandCopyFromBufferToBuffer;
@@ -3810,14 +3858,14 @@ public:
     if (!pBuffer)
       return;
     StartComputePass();
-    auto [mapped, offset] = allocator_->AllocateGPUHeap(4 * sizeof(uint32_t), 4);
+    auto [mapped, offset] = allocator_->AllocateGPUHeap(sizeof(PredicationRegion), alignof(PredicationRegion));
     if (allocator_->records_) {
-      allocator_->RecordGPUHeap(mapped, 4 * sizeof(uint32_t), "predicate header", 3 * sizeof(uint32_t), sizeof(uint32_t));
+      allocator_->RecordGPUHeap(mapped, sizeof(PredicationRegion), "predicate header", offsetof(PredicationRegion, skips),
+                                sizeof(uint32_t));
       predication_pass_ = allocator_->encoder_current;
     }
-    predication_region_ = static_cast<uint32_t *>(mapped);
-    predication_region_[0] = predication_region_[1] = predication_region_[3] = 0;
-    predication_region_[2] = Op == D3D12_PREDICATION_OP_EQUAL_ZERO;
+    predication_region_ = new (mapped) PredicationRegion{};
+    predication_region_->skip_if_zero = Op == D3D12_PREDICATION_OP_EQUAL_ZERO;
     auto &cmd_setpso = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
     cmd_setpso.type = WMTComputeCommandSetPSO;
     cmd_setpso.pso = device_->predicate;
@@ -3825,7 +3873,6 @@ public:
     const std::pair<obj_handle_t, uint64_t> buffers[] = {
         {static_cast<MTLD3D12Resource *>(pBuffer)->buffer->current()->buffer(), AlignedBufferOffset},
         {allocator_->gpu_heap_buffer_, offset},
-        {allocator_->gpu_heap_buffer_, 0},
     };
     for (uint8_t i = 0; i < std::size(buffers); i++) {
       auto &cmd = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
@@ -3934,15 +3981,15 @@ public:
       cmd->max_count_buffer = CountBufferAddress;
       PredicateIndirect(cmd);
       cmd->argument_buffer = ArgBufferAddress;
-      uint64_t root_arguments = 0;
+      uint64_t root_arguments = 0, static_samplers = 0;
 
       if (sig->UpdateRootArguments) {
         root_arguments = EncodeRootArgument(rootsig_compute_.ptr(), rootarg_compute_staging_, MaxCommandCount, true);
         cmd->rootsig_qwords = root_arguments;
         cmd->rootsig_qwords += allocator_->gpu_heap_buffer_address_;
         cmd->rootsig_qwords_stride = rootsig_compute_->UploadQwords;
-        cmd->static_samplers = EncodeStaticSamplers(rootsig_compute_.ptr());
-        cmd->static_samplers += allocator_->gpu_heap_buffer_address_;
+        static_samplers = EncodeStaticSamplers(rootsig_compute_.ptr());
+        cmd->static_samplers = static_samplers + allocator_->gpu_heap_buffer_address_;
         ResetIndirectState(sig, true);
       }
       if (parts) {
@@ -3955,7 +4002,7 @@ public:
           if (sig->UpdateRootArguments) {
             const std::pair<uint64_t, uint8_t> bindings[] = {
                 {root_arguments + i * rootsig_compute_->UploadQwords * sizeof(uint64_t), SM50_BINDING_INDEX_ROOT_ARGUMENTS},
-                {cmd->static_samplers - allocator_->gpu_heap_buffer_address_, SM50_BINDING_INDEX_STATIC_SAMPLERS}};
+                {static_samplers, SM50_BINDING_INDEX_STATIC_SAMPLERS}};
             for (auto [offset, index] : bindings) {
               auto &binding = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
               binding.type = WMTComputeCommandSetBuffer;
@@ -4122,7 +4169,11 @@ public:
     }
     // a GPU without mesh commands in indirect command buffers: every command is a draw of its own, which binds what
     // the command's stages read and has the threadgroups the resolver left for it (none past the count)
-    auto heap = allocator_->gpu_heap_buffer_address_;
+    // each address where it is in the buffer over the arguments it was made in: a longer buffer may have followed
+    // since (GrowArguments), and what the resolver wrote is read through the buffer it wrote through
+    auto draws = allocator_->ArgumentsAt(cmd->draws), roots = allocator_->ArgumentsAt(cmd->rootsig_qwords),
+         samplers = allocator_->ArgumentsAt(cmd->static_samplers), vertices = allocator_->ArgumentsAt(cmd->vertex_buffer),
+         counts = allocator_->ArgumentsAt(cmd->statistics), targets = allocator_->ArgumentsAt(cmd->so_targets);
     WMTSize object{cmd->geometry_threads, 1, 1}, mesh{1, 1, 1};
     // a mesh function alone takes the warps as mesh threadgroups, and what the object stage reads (MeshOnly)
     bool mesh_only = geometry && MeshOnly();
@@ -4143,31 +4194,32 @@ public:
       EncodeBuffer(stage, origin_offset, SM50_BINDING_INDEX_DRAW_ORIGIN);
     }
     for (UINT i = 0; i < MaxCommandCount; i++) {
-      auto at = cmd->draws - heap + i * sizeof(IndirectMeshDraw);
-      auto roots = cmd->rootsig_qwords - heap + i * cmd->rootsig_qwords_stride * sizeof(uint64_t);
+      auto at = draws.second + i * sizeof(IndirectMeshDraw);
+      auto root = roots.second + i * cmd->rootsig_qwords_stride * sizeof(uint64_t);
       for (auto stage : {WMTRenderCommandSetObjectBuffer, WMTRenderCommandSetMeshBuffer, WMTRenderCommandSetFragmentBuffer}) {
-        EncodeBuffer(stage, roots, SM50_BINDING_INDEX_ROOT_ARGUMENTS);
-        EncodeBuffer(stage, cmd->static_samplers - heap, SM50_BINDING_INDEX_STATIC_SAMPLERS);
+        EncodeBuffer(stage, root, SM50_BINDING_INDEX_ROOT_ARGUMENTS, roots.first);
+        EncodeBuffer(stage, samplers.second, SM50_BINDING_INDEX_STATIC_SAMPLERS, samplers.first);
       }
       if (!dispatch_mesh) {
         EncodeBuffer(
-            stage, cmd->vertex_buffer - heap + i * cmd->vertex_argbuf_stride, SM50_BINDING_INDEX_VERTEX_BUFFER
+            stage, vertices.second + i * cmd->vertex_argbuf_stride, SM50_BINDING_INDEX_VERTEX_BUFFER, vertices.first
         );
-        EncodeBuffer(stage, at + offsetof(IndirectMeshDraw, view), SM50_BINDING_INDEX_INDEX_BUFFER);
+        EncodeBuffer(stage, at + offsetof(IndirectMeshDraw, view), SM50_BINDING_INDEX_INDEX_BUFFER, draws.first);
         if (cmd->threads_per_patch)
           EncodeBuffer(
-              WMTRenderCommandSetObjectBuffer, at + offsetof(IndirectMeshDraw, control_points), SM50_BINDING_INDEX_PATCH_SIZE
+              WMTRenderCommandSetObjectBuffer, at + offsetof(IndirectMeshDraw, control_points),
+              SM50_BINDING_INDEX_PATCH_SIZE, draws.first
           );
-        EncodeBuffer(stage, at + offsetof(IndirectMeshDraw, arguments), SM50_BINDING_INDEX_DRAW_ARGUMENTS);
+        EncodeBuffer(stage, at + offsetof(IndirectMeshDraw, arguments), SM50_BINDING_INDEX_DRAW_ARGUMENTS, draws.first);
       }
       // a geometry stage adds its counts to its command's, as a direct draw's does (CountDraw)
       if (cmd->statistics)
-        EncodeBuffer(WMTRenderCommandSetMeshBuffer, cmd->statistics - heap + i * sizeof(PipelineStatisticsResult),
-                     SM50_BINDING_INDEX_PIPELINE_STATISTICS);
+        EncodeBuffer(WMTRenderCommandSetMeshBuffer, counts.second + i * sizeof(PipelineStatisticsResult),
+                     SM50_BINDING_INDEX_PIPELINE_STATISTICS, counts.first);
       auto draw = [&] {
         auto &draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups_indirect>();
         draw.type = WMTRenderCommandDrawMeshThreadgroupsIndirect;
-        draw.indirect_args_buffer = allocator_->gpu_heap_buffer_;
+        draw.indirect_args_buffer = draws.first;
         draw.indirect_args_offset = at + offsetof(IndirectMeshDraw, threadgroups);
         draw.object_threadgroup_size = object;
         draw.mesh_threadgroup_size = mesh;
@@ -4176,11 +4228,11 @@ public:
         draw();
         continue;
       }
-      StreamOut(cmd->so_targets - heap + i * sizeof(SM50_STREAM_OUTPUT_TARGETS), allocator_->so_scratch_offset_, draw, [&] {
+      StreamOut(targets.second + i * sizeof(SM50_STREAM_OUTPUT_TARGETS), allocator_->so_scratch_offset_, draw, [&] {
         auto &zero = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indirect>();
         zero.type = WMTRenderCommandDrawIndirect;
         zero.primitive_type = WMTPrimitiveTypePoint;
-        zero.indirect_args_buffer = allocator_->gpu_heap_buffer_;
+        zero.indirect_args_buffer = draws.first;
         zero.indirect_args_offset = at + offsetof(IndirectMeshDraw, zero);
       }, SinglePass());
     }
@@ -4517,6 +4569,7 @@ public:
       const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC *pDepthStencil, D3D12_RENDER_PASS_FLAGS Flags
   ) {
     D3D12_CPU_DESCRIPTOR_HANDLE targets[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    UINT target_count = 0;
     pass_resolves_.clear();
     auto resolve = [&](const D3D12_RENDER_PASS_ENDING_ACCESS &end) {
       if (end.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE)
@@ -4531,24 +4584,31 @@ public:
                  : type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS &&
                        type != sdk::D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE_LOCAL_UAV;
     };
+    // a pipeline's render targets are the bound ones, in "the order the raster bound surfaces appear in the render
+    // pass RTV list without any gaps"
     for (UINT i = 0; i < NumRenderTargets; i++) {
-      targets[i] = bound(pRenderTargets[i].BeginningAccess, false) ? pRenderTargets[i].cpuDescriptor
-                                                                    : D3D12_CPU_DESCRIPTOR_HANDLE{};
+      if (bound(pRenderTargets[i].BeginningAccess, false))
+        targets[target_count++] = pRenderTargets[i].cpuDescriptor;
       resolve(pRenderTargets[i].EndingAccess);
     }
     bool depth_stencil = pDepthStencil &&
                          (bound(pDepthStencil->DepthBeginningAccess, Flags & D3D12_RENDER_PASS_FLAG_BIND_READ_ONLY_DEPTH) ||
                           bound(pDepthStencil->StencilBeginningAccess, Flags & D3D12_RENDER_PASS_FLAG_BIND_READ_ONLY_STENCIL));
-    OMSetRenderTargets(NumRenderTargets, targets, FALSE, depth_stencil ? &pDepthStencil->cpuDescriptor : nullptr);
-    for (UINT i = 0; i < NumRenderTargets; i++)
+    OMSetRenderTargets(target_count, targets, FALSE, depth_stencil ? &pDepthStencil->cpuDescriptor : nullptr);
+    // a pass that resumes one goes on with what that one left, and clears nothing again: suspending and resuming
+    // "results in no rendering difference (versus ENDING_PRESERVE/BEGINNING_PRESERVE)" (Render Passes, HLK Testing)
+    bool clears = !(Flags & D3D12_RENDER_PASS_FLAG_RESUMING_PASS);
+    for (UINT i = 0; clears && i < NumRenderTargets; i++)
       if (pRenderTargets[i].BeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
-        ClearRenderTargetView(targets[i], pRenderTargets[i].BeginningAccess.Clear.ClearValue.Color, 0, nullptr);
+        ClearRenderTargetView(
+            pRenderTargets[i].cpuDescriptor, pRenderTargets[i].BeginningAccess.Clear.ClearValue.Color, 0, nullptr
+        );
     if (!pDepthStencil)
       return;
     auto &depth = pDepthStencil->DepthBeginningAccess, &stencil = pDepthStencil->StencilBeginningAccess;
     auto flags = (depth.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR ? D3D12_CLEAR_FLAG_DEPTH : 0) |
                  (stencil.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR ? D3D12_CLEAR_FLAG_STENCIL : 0);
-    if (flags)
+    if (clears && flags)
       ClearDepthStencilView(
           pDepthStencil->cpuDescriptor, (D3D12_CLEAR_FLAGS)flags, depth.Clear.ClearValue.DepthStencil.Depth,
           stencil.Clear.ClearValue.DepthStencil.Stencil, 0, nullptr
@@ -4565,6 +4625,8 @@ public:
           const_cast<D3D12_RECT *>(&sub.SrcRect), r.Format, r.ResolveMode
       );
     pass_resolves_.clear();
+    // the pass's targets "are not propagated out to the Command List": a draw after it has none
+    OMSetRenderTargets(0, nullptr, FALSE, nullptr);
   }
 
   // the device reports no meta commands, ray tracing, variable rate shading or mesh shaders, so a valid list never

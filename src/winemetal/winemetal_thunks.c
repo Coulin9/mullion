@@ -752,6 +752,22 @@ MTLDevice_newMeshRenderPipelineState(
   return params.ret_pso;
 }
 
+WINEMETAL_API obj_handle_t
+MTLDevice_newSpecializedRenderPipelineState(
+    obj_handle_t device, obj_handle_t pipeline, const struct WMTColorAttachmentBlendInfo colors[8], obj_handle_t *err_out
+) {
+  struct unixcall_mtldevice_newspecializedpso params;
+  params.device = device;
+  params.pipeline = pipeline;
+  WMT_MEMPTR_SET(params.colors, colors);
+  params.ret_error = 0;
+  params.ret_pso = 0;
+  UNIX_CALL(WMTUnixDeviceNewSpecializedRenderPipeline, &params);
+  if (err_out)
+    *err_out = params.ret_error;
+  return params.ret_pso;
+}
+
 WINEMETAL_API void
 MTLBlitCommandEncoder_encodeCommands(obj_handle_t encoder, const struct wmtcmd_base *cmd_head) {
   struct unixcall_generic_obj_cmd_noret params;
@@ -1600,6 +1616,15 @@ MTLDevice_maxArgumentBufferSamplerCount(obj_handle_t device) {
   return params.ret;
 }
 
+WINEMETAL_API bool
+MTLDevice_sparseResidencyInTiles(obj_handle_t device) {
+  struct unixcall_generic_obj_uint64_ret params;
+  params.handle = device;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixDeviceSparseResidencyInTiles, &params);
+  return params.ret;
+}
+
 WINEMETAL_API uint64_t
 MTLRenderPipelineState_maxTotalThreadgroupsPerMeshGrid(obj_handle_t pipeline) {
   struct unixcall_generic_obj_uint64_ret params;
@@ -1654,6 +1679,23 @@ MTLTexture_sparseTail(obj_handle_t texture, uint64_t *first_mip, uint64_t *bytes
   UNIX_CALL(153, &params);
   *first_mip = params.first_mip;
   *bytes = params.bytes;
+}
+
+WINEMETAL_API bool
+MTLDevice_sparseTailHolds(
+    obj_handle_t device, const struct WMTTextureInfo *info, uint32_t block_width, uint32_t block_height,
+    uint32_t block_bytes, uint64_t *first_mip, uint64_t *bytes
+) {
+  struct unixcall_sparse_tail_holds params = {0};
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.block_width = block_width;
+  params.block_height = block_height;
+  params.block_bytes = block_bytes;
+  UNIX_CALL(WMTUnixTextureSparseTailHolds, &params);
+  *first_mip = params.first_mip;
+  *bytes = params.bytes;
+  return params.ret;
 }
 
 WINEMETAL_API obj_handle_t
@@ -2045,6 +2087,17 @@ WMTGPUStatistics(obj_handle_t device, char *buffer, uint64_t size) {
   params.size = size;
   params.ret = 0;
   UNIX_CALL(WMTUnixGPUStatistics, &params);
+  return params.ret;
+}
+
+WINEMETAL_API uint64_t
+WMTDeviceReport(obj_handle_t device, char *buffer, uint64_t size) {
+  struct unixcall_wmtgpu_statistics params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.buffer, buffer);
+  params.size = size;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixDeviceReport, &params);
   return params.ret;
 }
 

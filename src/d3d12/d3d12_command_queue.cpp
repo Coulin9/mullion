@@ -399,8 +399,12 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     static const unsigned threads = [] {
       auto set = env::getEnvVar("MULLION_D3D12_ENCODE_THREADS");
       unsigned count = 0;
+      // a GPU capture keeps a copy of every buffer and heap the CPU writes for each command buffer that uses them, and
+      // each thread encodes into a command buffer of its own: a process that may be captured encodes on one
       if (std::from_chars(set.data(), set.data() + set.size(), count).ec != std::errc{} || !count)
-        count = std::clamp(mullion::thread::hardware_concurrency() / 2, 1u, 4u);
+        count = env::getEnvVar("MTL_CAPTURE_ENABLED") == "1"
+                    ? 1u
+                    : std::clamp(mullion::thread::hardware_concurrency() / 2, 1u, 4u);
       return std::min(count, kMaxEncodeThreads);
     }();
     return threads;
@@ -645,6 +649,32 @@ public:
         queue->SettleFeedback(true);
   }
 
+  static void
+  OutlastAll(MTLD3D12Device *device, const std::shared_ptr<void> &kept) {
+    std::lock_guard<mullion::mutex> lock(queues_mutex_);
+    for (auto queue : queues_)
+      if (queue->device_ == device)
+        queue->Outlast(kept);
+  }
+
+  // `kept` lives until what the queue was given before now has completed: the work held for its thread, which is
+  // encoded there, and the command buffers on the GPU. the wait is the thread's, behind that work, so the caller
+  // takes no lock a submission holds
+  void
+  Outlast(const std::shared_ptr<void> &kept) {
+    {
+      std::unique_lock<mullion::mutex> lock(held_mutex_);
+      if (!holding_ && !gate_->closed && !inflight_cmdbuf_count_.load())
+        return;
+    }
+    Hold([this, kept]() mutable {
+      // ends after the lock, where the work has completed already
+      std::function<void()> keeps = [kept = std::move(kept)] {};
+      std::lock_guard<mullion::mutex> lock(mutex_commit_);
+      retired_.Expect(inflight_cmdbuf_seq_ - 1, std::move(keeps));
+    }, true);
+  }
+
 private:
 
   std::string
@@ -693,7 +723,11 @@ private:
       if constexpr (Metal4)
         if (!scope.inflight->cmdbuf)
           return;
-      scope.inflight->cmdbuf.encodeWaitForEvent(mapped_->sharedEvent(), mapping_value_);
+      // a process that may be captured has only the CPU wait above: Metal's capture never sees the mapping queue's
+      // signal, so a captured command buffer waiting for it is never scheduled, and every queue stops behind it
+      static const bool capturable = env::getEnvVar("MTL_CAPTURE_ENABLED") == "1";
+      if (!capturable)
+        scope.inflight->cmdbuf.encodeWaitForEvent(mapped_->sharedEvent(), mapping_value_);
       Trace("tile mappings: done");
     };
     if (!Hold(work))
@@ -1404,7 +1438,8 @@ public:
       if (++region_tile == size.NumTiles)
         region++, region_tile = 0;
     }
-    if (operations.empty())
+    // a texture with all its memory has nothing to map in Metal (MTLD3D12Resource::dense_tiles)
+    if (operations.empty() || static_cast<MTLD3D12Resource *>(resource)->dense_tiles)
       return;
     std::function<void(WMT::MTL4CommandQueue)> settle = [](auto) {};
     if (operations.back().mode == WMTSparseMappingModeUnmap)
@@ -1459,6 +1494,9 @@ public:
         destination.index(*dst_region_start_coordinate, *region_size, 0) >
             source.index(*src_region_start_coordinate, *region_size, 0))
       std::reverse(operations.begin(), operations.end());
+    // nor between textures of which either has all its memory: such a texture keeps its own
+    if (src->dense_tiles || dst->dense_tiles)
+      return;
     // a copy of a tile that is not mapped unmaps; which of a buffer's are is not kept here
     std::function<void(WMT::MTL4CommandQueue)> settle = [](auto) {};
     if (unmaps || !source.texture)
@@ -2648,6 +2686,14 @@ public:
     return mullion::CreateSwapChain(pFactory, device_, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
   }
 
+  // the presents the queue holds back keep their swap chains: they are run first, unless the queue waits for a fence,
+  // which only the application ends
+  void STDMETHODCALLTYPE
+  ReleasedSwapChains() override {
+    std::unique_lock<mullion::mutex> lock(held_mutex_);
+    held_changed_.wait(lock, [&] { return held_.empty() || gate_->closed; });
+  }
+
   HRESULT
   Present(
       IUnknown *swapchain, Presenter *presenter, ID3D12Resource *backbuffer, TextureViewKey view,
@@ -2846,6 +2892,12 @@ void
 SettleCommandQueueFeedback(MTLD3D12Device *pDevice) {
   MTLD3D12CommandQueueImpl<true>::SettleAll(pDevice);
   MTLD3D12CommandQueueImpl<false>::SettleAll(pDevice);
+}
+
+void
+OutlastCommandQueues(MTLD3D12Device *pDevice, const std::shared_ptr<void> &kept) {
+  MTLD3D12CommandQueueImpl<true>::OutlastAll(pDevice, kept);
+  MTLD3D12CommandQueueImpl<false>::OutlastAll(pDevice, kept);
 }
 
 HRESULT
