@@ -70,6 +70,10 @@ std::string getExeBaseName();
  */
 std::string getExePath();
 
+#ifdef MULLION_NATIVE
+int32_t setExecutablePath(const char *path);
+#endif
+
 /**
  * \brief Sets name of the calling thread
  * \param [in] name Thread name

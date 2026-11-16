@@ -33,12 +33,17 @@ main(int argc, char **argv) {
   }
   auto create_device = reinterpret_cast<decltype(&D3D12CreateDevice)>(dlsym(module, "D3D12CreateDevice"));
   auto native_abi = reinterpret_cast<PFN_dxn_native_abi_version>(dlsym(module, "mullion_native_abi_version"));
+  auto set_executable_path = reinterpret_cast<PFN_dxn_set_executable_path>(dlsym(module, "mullion_set_executable_path"));
   auto event_create = reinterpret_cast<PFN_dxn_event_create>(dlsym(module, "mullion_event_create"));
   auto event_close = reinterpret_cast<PFN_dxn_event_close>(dlsym(module, "mullion_event_close"));
   auto event_dup_fd = reinterpret_cast<PFN_dxn_event_dup_fd>(dlsym(module, "mullion_event_dup_fd"));
   auto close_shared = reinterpret_cast<PFN_dxn_shared_handle_close>(dlsym(module, "mullion_shared_handle_close"));
   CHECK(create_device && native_abi && event_create && event_close && event_dup_fd && close_shared);
   CHECK(native_abi() == DXN_ABI_VERSION);
+  CHECK(set_executable_path && set_executable_path(nullptr) == 0);
+  CHECK(set_executable_path("C:\\Games\\..") < 0);
+  CHECK(set_executable_path("\xff.exe") < 0);
+  CHECK(set_executable_path("C:\\Games\\native_sharing.exe") == 0);
 
   Com<ID3D12Device> device;
   CHECK_HR(create_device(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));

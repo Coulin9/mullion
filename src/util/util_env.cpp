@@ -19,11 +19,45 @@
 #include <limits.h>
 #endif
 
+#ifdef MULLION_NATIVE
+#include <CoreFoundation/CFString.h>
+#include <mutex>
+#include <new>
+#include <string_view>
+#endif
+
 #include "util_env.hpp"
 #include <cstring>
 #include "unknwn.h"
 
 namespace mullion::env {
+
+#ifdef MULLION_NATIVE
+static std::mutex executable_path_mutex;
+static std::string executable_path;
+
+int32_t setExecutablePath(const char *path) {
+  const std::string_view value = path ? path : "";
+  if (!value.empty()) {
+    const auto separator = value.find_last_of("/\\");
+    const auto name = separator == value.npos ? value : value.substr(separator + 1);
+    if (name.empty() || name == "." || name == ".." ||
+        name.find_first_of("\r\n") != name.npos)
+      return -1;
+    CFStringRef utf8 = CFStringCreateWithCString(nullptr, path, kCFStringEncodingUTF8);
+    if (!utf8)
+      return -1;
+    CFRelease(utf8);
+  }
+  try {
+    std::lock_guard lock(executable_path_mutex);
+    executable_path = value;
+    return 0;
+  } catch (const std::bad_alloc &) {
+    return -1;
+  }
+}
+#endif
 
 std::string getEnvVar(const char *name) {
 #ifdef _WIN32
@@ -63,7 +97,11 @@ size_t matchFileExtension(const std::string &name, const char *ext) {
 
 std::string getExeName() {
   std::string fullPath = getExePath();
+#ifdef MULLION_NATIVE
+  auto n = fullPath.find_last_of("/\\");
+#else
   auto n = fullPath.find_last_of(env::PlatformDirSlash);
+#endif
 
   return (n != std::string::npos) ? fullPath.substr(n + 1) : fullPath;
 }
@@ -95,6 +133,9 @@ std::string getExePath() {
   size_t count = readlink("/proc/self/exe", exePath.data(), exePath.size());
 
   return std::string(exePath.begin(), exePath.begin() + count);
+#elif defined(MULLION_NATIVE)
+  std::lock_guard lock(executable_path_mutex);
+  return executable_path;
 #else
   return std::string(""); //TODO
 #endif
