@@ -17,6 +17,7 @@
 #include <mach/mach_time.h>
 #include <sys/sysctl.h>
 #ifdef MULLION_NATIVE
+#include <Block.h>
 #include <sys/mman.h>
 #endif
 #define WINEMETAL_API
@@ -26,6 +27,46 @@
 typedef int NTSTATUS;
 #define STATUS_SUCCESS 0
 #define STATUS_UNSUCCESSFUL 0xC0000001
+
+#ifdef MULLION_NATIVE
+typedef void (^MetalWorkRunner)(const char *stage, dispatch_block_t submit);
+static pthread_mutex_t metal_work_mutex = PTHREAD_MUTEX_INITIALIZER;
+static MetalWorkRunner metal_work_runner;
+
+// One authenticated VM context owns this worker. The runner can be used by
+// any of the worker's submission threads and is cleared on disconnection.
+void
+mullion_set_work_context_metal_runner(MetalWorkRunner runner) {
+  MetalWorkRunner next = runner ? Block_copy(runner) : NULL;
+  pthread_mutex_lock(&metal_work_mutex);
+  MetalWorkRunner previous = metal_work_runner;
+  metal_work_runner = next;
+  pthread_mutex_unlock(&metal_work_mutex);
+  if (previous)
+    Block_release(previous);
+}
+#endif
+
+static void
+submit_metal_work(const char *stage, dispatch_block_t submit) {
+#ifdef MULLION_NATIVE
+  pthread_mutex_lock(&metal_work_mutex);
+  MetalWorkRunner runner = metal_work_runner ? Block_copy(metal_work_runner) : NULL;
+  pthread_mutex_unlock(&metal_work_mutex);
+  if (runner) {
+    @try {
+      runner(stage, submit);
+    } @finally {
+      Block_release(runner);
+    }
+    return;
+  }
+#else
+  (void)stage;
+#endif
+  submit();
+}
+
 // a call that makes an object returns it retained, and drains what Metal autoreleased while making it: the calling
 // thread may have no pool, and then all of that, a texture's validation records with the texture among them, leaks
 #define CREATES(name)                                                                                                \
@@ -181,12 +222,12 @@ _MTLCommandBuffer_commit(void *obj) {
     dispatch_async(test_late_commits, ^{
       dispatch_semaphore_wait(test_late_timer, deadline);
       @autoreleasepool {
-        [buffer commit];
+        submit_metal_work("metal3-commit", ^{ [buffer commit]; });
       }
     });
     pthread_mutex_unlock(&test_late_mutex);
   } else {
-    [buffer commit];
+    submit_metal_work("metal3-commit", ^{ [buffer commit]; });
   }
   return STATUS_SUCCESS;
 }
@@ -4430,16 +4471,18 @@ _MTL4CommandQueue_updateMappings(void *obj) {
   struct unixcall_mtl4_mappings *params = obj;
   if (@available(macOS 26.0, *)) {
     id<MTL4CommandQueue> queue = (id<MTL4CommandQueue>)params->queue;
-    if (params->texture)
-      [queue updateTextureMappings:(id<MTLTexture>)params->resource
-                              heap:(id<MTLHeap>)params->other
-                        operations:params->operations.ptr
-                             count:params->count];
-    else
-      [queue updateBufferMappings:(id<MTLBuffer>)params->resource
-                             heap:(id<MTLHeap>)params->other
-                       operations:params->operations.ptr
-                            count:params->count];
+    submit_metal_work("metal4-update-mappings", ^{
+      if (params->texture)
+        [queue updateTextureMappings:(id<MTLTexture>)params->resource
+                                heap:(id<MTLHeap>)params->other
+                          operations:params->operations.ptr
+                               count:params->count];
+      else
+        [queue updateBufferMappings:(id<MTLBuffer>)params->resource
+                               heap:(id<MTLHeap>)params->other
+                         operations:params->operations.ptr
+                              count:params->count];
+    });
   }
   return STATUS_SUCCESS;
 }
@@ -4449,16 +4492,18 @@ _MTL4CommandQueue_copyMappings(void *obj) {
   struct unixcall_mtl4_mappings *params = obj;
   if (@available(macOS 26.0, *)) {
     id<MTL4CommandQueue> queue = (id<MTL4CommandQueue>)params->queue;
-    if (params->texture)
-      [queue copyTextureMappingsFromTexture:(id<MTLTexture>)params->resource
-                                  toTexture:(id<MTLTexture>)params->other
-                                 operations:params->operations.ptr
-                                      count:params->count];
-    else
-      [queue copyBufferMappingsFromBuffer:(id<MTLBuffer>)params->resource
-                                 toBuffer:(id<MTLBuffer>)params->other
-                               operations:params->operations.ptr
-                                    count:params->count];
+    submit_metal_work("metal4-copy-mappings", ^{
+      if (params->texture)
+        [queue copyTextureMappingsFromTexture:(id<MTLTexture>)params->resource
+                                    toTexture:(id<MTLTexture>)params->other
+                                   operations:params->operations.ptr
+                                        count:params->count];
+      else
+        [queue copyBufferMappingsFromBuffer:(id<MTLBuffer>)params->resource
+                                   toBuffer:(id<MTLBuffer>)params->other
+                                  operations:params->operations.ptr
+                                       count:params->count];
+    });
   }
   return STATUS_SUCCESS;
 }
@@ -4481,10 +4526,10 @@ _MTL4CommandQueue_event(void *obj) {
     // and the event)
     if (test_late_ns) {
       pthread_mutex_lock(&test_late_mutex);
-      dispatch_async(test_late_commits, call);
+      dispatch_async(test_late_commits, ^{ submit_metal_work("metal4-event", call); });
       pthread_mutex_unlock(&test_late_mutex);
     } else {
-      call();
+      submit_metal_work("metal4-event", call);
     }
   }
   return STATUS_SUCCESS;
@@ -6145,12 +6190,12 @@ _MTL4CommandBuffer_commit(void *obj) {
       dispatch_async(test_late_commits, ^{
         dispatch_semaphore_wait(test_late_timer, deadline);
         @autoreleasepool {
-          commit();
+          submit_metal_work("metal4-commit", commit);
         }
       });
       pthread_mutex_unlock(&test_late_mutex);
     } else {
-      commit();
+      submit_metal_work("metal4-commit", commit);
     }
     [options release];
   }

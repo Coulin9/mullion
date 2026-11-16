@@ -10,3 +10,4 @@ _mullion_native_abi_version
 _mullion_event_create
 _mullion_event_close
 _mullion_event_dup_fd
+_mullion_set_work_context_metal_runner
