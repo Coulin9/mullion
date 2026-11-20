@@ -1388,14 +1388,24 @@ MTLDevice_newBinaryArchive(obj_handle_t device, const char *url, obj_handle_t *e
   return params.ret_archive;
 }
 
-WINEMETAL_API void
+WINEMETAL_API bool
 MTLBinaryArchive_serialize(obj_handle_t archive, const char *url, obj_handle_t *err_out) {
   struct unixcall_mtlbinaryarchive_serialize params;
   params.archive = archive;
+  params.ret_error = NULL_OBJECT_HANDLE;
   WMT_MEMPTR_SET(params.url, url);
-  UNIX_CALL(113, &params);
+  NTSTATUS status = WINE_UNIX_CALL(113, &params);
   if (err_out)
-    *err_out = params.ret_error;
+    *err_out = status ? NULL_OBJECT_HANDLE : params.ret_error;
+  return !status;
+}
+
+WINEMETAL_API void
+MTLBinaryArchive_add(obj_handle_t archive, obj_handle_t pipeline) {
+  struct unixcall_generic_obj_obj_noret params;
+  params.handle = archive;
+  params.arg = pipeline;
+  UNIX_CALL(WMTUnixBinaryArchiveAdd, &params);
 }
 
 WINEMETAL_API obj_handle_t
@@ -1454,6 +1464,14 @@ WMTSetMetalShaderCachePath(const char *path) {
   params.ret_success = 0;
   UNIX_CALL(119, &params);
   return params.ret_success;
+}
+
+WINEMETAL_API void
+WMTRemoveOtherVersions(const char *stem, const char *kept) {
+  struct unixcall_remove_other_versions params;
+  WMT_MEMPTR_SET(params.stem, stem);
+  WMT_MEMPTR_SET(params.kept, kept);
+  UNIX_CALL(WMTUnixRemoveOtherVersions, &params);
 }
 
 WINEMETAL_API obj_handle_t

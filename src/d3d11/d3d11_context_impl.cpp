@@ -4048,6 +4048,15 @@ public:
       UINT StartSlot, UINT NumBuffers, ID3D11Buffer *const *ppConstantBuffers, const UINT *pFirstConstant,
       const UINT *pNumConstants
   ) {
+    // a range is a multiple of 16 constants from a multiple of 16, no more than a shader is shown, and comes with
+    // both arrays or neither (Microsoft Learn, VSSetConstantBuffers1). Windows drops a call with another, whole
+    // (Wine's test_constant_buffer_offset)
+    if (!pFirstConstant != !pNumConstants)
+      return;
+    for (unsigned i = 0; pFirstConstant && i < NumBuffers; i++)
+      if ((pFirstConstant[i] | pNumConstants[i]) % 16 || pNumConstants[i] > D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT)
+        return;
+
     std::lock_guard<mutex_t> lock(mutex);
 
     auto &ShaderStage = state_.ShaderStages[Stage];
@@ -4231,6 +4240,9 @@ public:
   SetSamplers(UINT StartSlot, UINT NumSamplers, ID3D11SamplerState *const *ppSamplers) {
     std::lock_guard<mutex_t> lock(mutex);
 
+    bool was_minmax = false;
+    if constexpr (Stage == PipelineStage::Pixel)
+      was_minmax = PixelMinMaxFiltering();
     auto &ShaderStage = state_.ShaderStages[Stage];
     for (unsigned Slot = StartSlot; Slot < StartSlot + NumSamplers; Slot++) {
       auto pSampler = static_cast<D3D11SamplerState *>(ppSamplers[Slot - StartSlot]);
@@ -4252,6 +4264,9 @@ public:
         }
       }
     }
+    if constexpr (Stage == PipelineStage::Pixel)
+      if (was_minmax != PixelMinMaxFiltering())
+        InvalidateRenderPipeline();
   }
 
   template <PipelineStage Stage>
@@ -5535,6 +5550,21 @@ public:
     return ptr ? ptr->GetManagedShader() : nullptr;
   };
 
+  bool
+  PixelMinMaxFiltering() {
+    auto shader = GetManagedShader<PipelineStage::Pixel>();
+    if (!shader)
+      return false;
+    for (const auto &[slot, entry] : state_.ShaderStages[PipelineStage::Pixel].Samplers) {
+      if (!(shader->reflection().SamplerSlotMask & (1u << slot)))
+        continue;
+      auto metadata = entry.Sampler->sampler()->metadata;
+      if ((metadata >> SM50_SAMPLER_METADATA_REDUCTION) & ((1u << SM50_SAMPLER_METADATA_REDUCTION_BITS) - 1))
+        return true;
+    }
+    return false;
+  }
+
   template <bool IndexedDraw>
   void
   InitializeGraphicsPipelineDesc(MTL_GRAPHICS_PIPELINE_DESC &Desc) {
@@ -5543,6 +5573,7 @@ public:
     auto GS = GetManagedShader<PipelineStage::Geometry>();
     Desc.VertexShader = GetManagedShader<PipelineStage::Vertex>();
     Desc.PixelShader = PS;
+    Desc.PixelMinMaxFiltering = PixelMinMaxFiltering();
     // FIXME: ensure valid state: hull and domain shader none or both are bound
     Desc.HullShader = GetManagedShader<PipelineStage::Hull>();
     Desc.DomainShader = GetManagedShader<PipelineStage::Domain>();
@@ -6232,6 +6263,7 @@ class MTLD3D11ContextExt : public IMTLD3D11ContextExt1 {
     WMTPixelFormat depth_pixel_format;
     WMTPixelFormat motion_vector_pixel_format;
     bool auto_exposure;
+    bool jittered;
     uint32_t input_width;
     uint32_t input_height;
     uint32_t output_width;
@@ -6299,6 +6331,7 @@ public:
 
     for(CachedTemporalScaler& entry: scaler_cache_) {
       if(pDesc->AutoExposure != entry.auto_exposure) continue;
+      if(bool(pDesc->MotionVectorJittered) != entry.jittered) continue;
       if(input->width() != entry.input_width) continue;
       if(input->height() != entry.input_height) continue;
       if(output->width() != entry.output_width) continue;
@@ -6319,12 +6352,14 @@ public:
       scaler_entry.output_pixel_format = output->pixelFormat();
       scaler_entry.depth_pixel_format = depth->pixelFormat();
       scaler_entry.motion_vector_pixel_format = motion_vector_format;
-      WMTFXTemporalScalerInfo info;
+      WMTFXTemporalScalerInfo info{};
       info.color_format = scaler_entry.color_pixel_format;
       info.output_format = scaler_entry.output_pixel_format;
       info.depth_format = scaler_entry.depth_pixel_format;
       info.motion_format = motion_vector_format;
       scaler_entry.auto_exposure = pDesc->AutoExposure;
+      scaler_entry.jittered = pDesc->MotionVectorJittered;
+      info.jittered_motion_vectors = scaler_entry.jittered;
       scaler_entry.input_width = input->width();
       scaler_entry.input_height = input->height();
       scaler_entry.output_width = output->width();
@@ -6337,7 +6372,9 @@ public:
       info.input_content_properties_enabled = true;
       info.input_content_min_scale = 1.0f;
       info.input_content_max_scale =  3.0f;
-      info.requires_synchronous_initialization = true;
+      // the scaler is returned before MetalFX has compiled its pipelines, and upscales more slowly until it has, to
+      // the same image (MTLFXTemporalScalerDescriptor, requiresSynchronousInitialization)
+      info.requires_synchronous_initialization = false;
       scaler_entry.scaler = new TemporalScaler(ctx_->device->GetMTLDevice(), info);
       if (pDesc->MotionVectorInDisplayRes) {
         WMTTextureInfo tex_info{};

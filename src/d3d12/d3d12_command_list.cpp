@@ -215,17 +215,64 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
     return true;
   }
 
+  // where a root signature's arguments were last uploaded in this recording, in which of the buffers over what the
+  // GPU reads: a pass that starts with the arguments as they were binds that copy again. no buffer once an argument
+  // or the root signature changes
+  struct UploadedRootArguments {
+    obj_handle_t buffer = 0;
+    uint64_t offset = 0;
+  };
+  UploadedRootArguments rootarg_graphics_uploaded_, rootarg_compute_uploaded_;
+
+  // an argument of `dirty`'s root signature is no longer what was uploaded: the next draw or dispatch uploads them
+  void
+  RootArgumentsChanged(DirtyState dirty) {
+    dirty_state_.set(dirty);
+    (dirty == DirtyState::GraphicsRootArguments ? rootarg_graphics_uploaded_ : rootarg_compute_uploaded_).buffer = 0;
+  }
+
+  // the uploaded arguments of a root signature, which are uploaded first when they have changed since. a recording
+  // that keeps what each pass read (GPURecording) uploads them for every pass
+  UploadedRootArguments
+  UploadRootArguments(MTLD3D12RootSignature *rootsig, const uint64_t *staging, UploadedRootArguments &uploaded) {
+    if (!uploaded.buffer || allocator_->records_) {
+      uploaded.offset = EncodeRootArgument(rootsig, staging);
+      uploaded.buffer = obj_handle_t(allocator_->gpu_heap_buffer_);
+    }
+    return uploaded;
+  }
+
   /* a root signature that indexes the heaps directly reads their addresses from its root arguments */
   void
   WriteHeapArguments(MTLD3D12RootSignature *rootsig, uint64_t *staging, DirtyState dirty) {
     if (!rootsig)
       return;
+    auto write = [&](uint32_t qword, uint64_t value) {
+      if (staging[qword] == value)
+        return;
+      staging[qword] = value;
+      RootArgumentsChanged(dirty);
+    };
     if (rootsig->ResourceHeapQword != ~0u)
-      staging[rootsig->ResourceHeapQword] = resource_heap_;
+      write(rootsig->ResourceHeapQword, resource_heap_);
     if (rootsig->SamplerHeapQword != ~0u)
-      staging[rootsig->SamplerHeapQword] = sampler_heap_;
-    staging[rootsig->AtomicLocksQword] = device_->GetAtomicLocks();
-    dirty_state_.set(dirty);
+      write(rootsig->SamplerHeapQword, sampler_heap_);
+    write(rootsig->AtomicLocksQword, device_->GetAtomicLocks());
+  }
+
+  // a root constant buffer view of address 0 is a null view, and one the application has not set since the root
+  // signature was is undefined to read: both read the device's buffer of zeros, as a null view in a descriptor heap
+  // does. root SRVs and UAVs keep address 0: a shader finds a null acceleration structure by it, and a UAV's writes
+  // would land in the zeros every null view reads
+  void
+  NullRootViews(MTLD3D12RootSignature *rootsig, uint64_t *staging, DirtyState dirty) {
+    for (uint32_t i = 0; i < rootsig->ParameterSlots; i++) {
+      auto &slot = staging[rootsig->SlotQwordOffsets[i]];
+      if (rootsig->SlotTypes[i] == D3D12_ROOT_PARAMETER_TYPE_CBV && !slot) {
+        slot = device_->GetNullBuffer();
+        RootArgumentsChanged(dirty);
+      }
+    }
   }
 
   FLOAT blend_factor_[4];
@@ -249,30 +296,22 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   // what orders the passes (EncoderData::overlap): events that order work without a pass of their own (barriers,
   // queries, predication, stream output) so far; the last pass a draw or dispatch began, and how many such events
   // there had been then; and what render passes drew to since the last ordering point
-  uint64_t order_serial_ = 0, full_order_serial_ = 0, plain_serial_ = 0;
+  uint64_t order_serial_ = 0, plain_serial_ = 0;
   const EncoderData *plain_pass_ = nullptr;
   std::vector<const Texture *> overlap_targets_;
+  // an ordering point since the last pass a draw or dispatch began that the vertex stages of draws after it may
+  // depend on (EncoderData::late)
+  bool vertex_order_ = false;
 
   // work after this point waits for work before it: the open pass too, which barriers that do not end it (Order),
-  // queries and stream output leave open, and whose later draws or dispatches may read what passes before it wrote
+  // queries and stream output leave open, and whose later draws or dispatches may read what passes before it wrote.
+  // `vertices`: work after it may read in a vertex stage what work before it wrote
   void
-  MarkOrderingPoint() {
+  OrderingPoint(bool vertices = true) {
     order_serial_++;
+    vertex_order_ |= vertices;
     if (allocator_->encoder_current)
       allocator_->encoder_current->overlap = PassOverlap::Ordered;
-  }
-
-  void
-  RequireFullOrder() {
-    full_order_serial_ = order_serial_;
-    if (auto pass = allocator_->encoder_current; pass && pass->type == EncoderType::Render)
-      static_cast<RenderEncoderData *>(pass)->fragment_wait_after = nullptr;
-  }
-
-  void
-  OrderingPoint() {
-    MarkOrderingPoint();
-    RequireFullOrder();
   }
 
   // the overlap of a pass a draw or dispatch just began, after the passes before it are in the list
@@ -289,9 +328,10 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
       return texture && std::ranges::find(overlap_targets_, texture) != overlap_targets_.end();
     });
     pass->overlap = !follows ? PassOverlap::Ordered : shared ? PassOverlap::Shared : PassOverlap::Independent;
-    if (pass->type == EncoderType::Render && plain_pass_ && allocator_->encoder_last == plain_pass_ &&
-        plain_pass_->type == EncoderType::Render && full_order_serial_ <= plain_serial_ && plain_serial_ < order_serial_)
-      static_cast<RenderEncoderData *>(pass)->fragment_wait_after = plain_pass_;
+    // only barriers whose work after them is pixel shading, render targets or depth since the last such pass
+    pass->late = !first && !follows && plain_pass_ && allocator_->encoder_last == plain_pass_ && !vertex_order_ &&
+                 pass->type == EncoderType::Render;
+    vertex_order_ = false;
     for (auto texture : targets)
       if (texture)
         overlap_targets_.push_back(texture);
@@ -788,9 +828,11 @@ public:
 
     rootsig_graphics_ = nullptr;
     memset(rootarg_graphics_staging_, 0, sizeof(rootarg_graphics_staging_));
+    rootarg_graphics_uploaded_ = {};
 
     rootsig_compute_ = nullptr;
     memset(rootarg_compute_staging_, 0, sizeof(rootarg_compute_staging_));
+    rootarg_compute_uploaded_ = {};
 
     memset(vertex_buffers_.data(), 0, sizeof(vertex_buffers_));
     std::fill(std::begin(so_views_), std::end(so_views_), D3D12_STREAM_OUTPUT_BUFFER_VIEW{});
@@ -819,11 +861,11 @@ public:
     markers_.clear();
     plain_pass_ = nullptr;
     order_serial_ = 0;
-    full_order_serial_ = 0;
     overlap_targets_.clear();
     named_.clear();
     hoisted_ = nullptr;
     hoisted_for_ = nullptr;
+    structure_run_ = {};
     // a bundle's initial state is its first call
     if (pInitialPipelineState && type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE)
       SetPipelineState(pInitialPipelineState);
@@ -923,7 +965,7 @@ public:
   };
 
   std::tuple<uint64_t, uint64_t>
-  PopulateVertexBufferTable(uint32_t Count, bool Written = false) {
+  PopulateVertexBufferTable() {
     auto slot_mask = pso_graphics_ ? pso_graphics_->slot_mask : 0;
     if (!slot_mask)
       return {0, 0};
@@ -935,21 +977,19 @@ public:
     };
     auto stride = align(sizeof(VERTEX_BUFFER_ENTRY) * max_slot, 16);
 
-    auto [mapped, offset] = allocator_->AllocateGPUHeap(stride * Count, 16);
-    if (allocator_->records_ && !Written)
-      allocator_->RecordGPUHeap(mapped, stride * Count, "vertex buffer table");
+    auto [mapped, offset] = allocator_->AllocateGPUHeap(stride, 16);
+    if (allocator_->records_)
+      allocator_->RecordGPUHeap(mapped, stride, "vertex buffer table");
 
-    for (unsigned i = 0; i < Count; i++) {
-      VERTEX_BUFFER_ENTRY *entries = (VERTEX_BUFFER_ENTRY *)(reinterpret_cast<char *>(mapped) + i * stride);
-      for (unsigned slot = 0, index = 0; slot < max_slot; slot++) {
-        if (!(slot_mask & (1 << slot)))
-          continue;
-        auto &state = vertex_buffers_[slot];
-        entries[index].buffer_handle = state.BufferLocation;
-        entries[index].stride = state.StrideInBytes;
-        entries[index++].length = state.SizeInBytes;
-      };
-    }
+    VERTEX_BUFFER_ENTRY *entries = (VERTEX_BUFFER_ENTRY *)mapped;
+    for (unsigned slot = 0, index = 0; slot < max_slot; slot++) {
+      if (!(slot_mask & (1 << slot)))
+        continue;
+      auto &state = vertex_buffers_[slot];
+      entries[index].buffer_handle = state.BufferLocation;
+      entries[index].stride = state.StrideInBytes;
+      entries[index++].length = state.SizeInBytes;
+    };
 
     return {offset, stride};
   }
@@ -1128,14 +1168,16 @@ public:
   }
 
   DrawCallStatus
-  PreDraw(bool SkipResourceBinding = false, bool DirectNonIndexed = false) {
-    // a sampler that needs what the pipeline leaves out may have come since it was set (MTLD3D12PipelineState::left_out)
-    while (pso_graphics_ && (pso_graphics_->left_out & device_->sampler_emulations)) {
-      pso_graphics_ = static_cast<MTLD3D12GraphicsPipelineState *>(pso_graphics_->Fuller(device_));
-      dirty_state_.set(DirtyState::GraphicsPipelineState);
-    }
+  PreDraw(bool SkipResourceBinding = false, bool Native = false) {
+    TakeFuller();
     if (!pso_graphics_)
       return DrawCallStatus::Invalid;
+    // Metal's tessellator binds the domain shader's stage as a vertex stage, the mesh pipeline as a mesh stage
+    if (Native != native_bound_) {
+      native_bound_ = Native;
+      dirty_state_.set(DirtyState::GraphicsPipelineState, DirtyState::VertexBuffer, DirtyState::GraphicsRootArguments);
+      dirty_state_.set(DirtyState::GraphicsRootSignature);
+    }
     // a draw that tests the depth bounds where the GPU cannot finds the samples that pass first, unless the pass it is
     // in has them for this range and nothing has written depth since
     bool bounds_tested = pso_graphics_->depth_bounds_emulated && pso_graphics_->dsv_mask && dsv.Texture &&
@@ -1265,21 +1307,16 @@ public:
         shading_rate_pass_ = allocator_->encoder_current;
       if (!active_queries_.empty())
         CountVisibility();
+    } else if (vertex_order_) {
+      // a draw whose vertices may read what the pass's own work since it began did not
+      allocator_->encoder_current->late = false;
     }
-
-    auto render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
-    if (render->fragment_wait_after &&
-        (!DirectNonIndexed || !rootsig_graphics_ || !rootsig_graphics_->PixelOnlyResources ||
-         pso_graphics_->slot_mask || !pso_graphics_->pixel_shader || pso_graphics_->uses_uav ||
-         pso_graphics_->threads_per_patch || Geometry() || pso_graphics_->mesh_shader || pso_graphics_->conservative ||
-         pso_graphics_->stream_output || predication_region_ || !active_statistics_.empty() || coarse))
-      render->fragment_wait_after = nullptr;
 
     // the conservative rasterizer's viewports and state, bound again when they or the pipeline change
     bool conservative_dirty = dirty_state_.test(DirtyState::GraphicsPipelineState) || dirty_state_.test(DirtyState::Viewport);
     if (dirty_state_.test(DirtyState::GraphicsPipelineState)) {
       // a pipeline for a topology with adjacency is made here, and may fail
-      auto pipeline = Pipeline();
+      auto pipeline = Native ? RenderTargets(pso_graphics_->pso_patches) : Pipeline();
       if (!pipeline || (pso_graphics_->stream_output && !SinglePass() && !Pipeline(true)))
         return DrawCallStatus::Invalid;
       auto &cmd_setpso = allocator_->EncodeRenderCommand<wmtcmd_render_setpso>();
@@ -1319,44 +1356,50 @@ public:
     // under tessellation the vertex and hull shaders run in the object stage, the domain shader in the mesh stage; with
     // a geometry shader the vertex shader runs in the object stage, the geometry shader in the mesh stage
     // a mesh shader pipeline has an object stage (its amplification shader, if any) and a mesh stage
-    bool mesh = pso_graphics_->threads_per_patch || Geometry() || pso_graphics_->mesh_shader;
+    bool mesh = (pso_graphics_->threads_per_patch && !Native) || Geometry() || pso_graphics_->mesh_shader;
     bool vertex = !mesh;
     // the root arguments and static samplers reach the mesh stage where its function reads them
     // (mesh_reads_root_arguments): not the pass-through mesh stage of a pipeline without a geometry shader
     bool mesh_reads = mesh && pso_graphics_->mesh_reads_root_arguments;
-    auto geometry_buffer = [&](uint64_t Offset, uint8_t Index) {
+    auto geometry_buffer = [&](uint64_t Offset, uint8_t Index, obj_handle_t Earlier = 0) {
       if (mesh)
-        EncodeBuffer(WMTRenderCommandSetObjectBuffer, Offset, Index);
+        EncodeBuffer(WMTRenderCommandSetObjectBuffer, Offset, Index, Earlier);
       if (mesh_reads)
-        EncodeBuffer(WMTRenderCommandSetMeshBuffer, Offset, Index);
+        EncodeBuffer(WMTRenderCommandSetMeshBuffer, Offset, Index, Earlier);
       if (vertex)
-        EncodeBuffer(WMTRenderCommandSetVertexBuffer, Offset, Index);
-      EncodeBuffer(WMTRenderCommandSetFragmentBuffer, Offset, Index);
+        EncodeBuffer(WMTRenderCommandSetVertexBuffer, Offset, Index, Earlier);
+      EncodeBuffer(WMTRenderCommandSetFragmentBuffer, Offset, Index, Earlier);
     };
     if (dirty_state_.test(DirtyState::VertexBuffer)) {
-      auto [Offset, Stride] = PopulateVertexBufferTable(1);
+      auto [Offset, Stride] = PopulateVertexBufferTable();
       // and the mesh stage, which runs the vertex shader where a list of triangles has it alone (MeshOnly)
       if (Stride && mesh) {
         EncodeBuffer(WMTRenderCommandSetObjectBuffer, Offset, SM50_BINDING_INDEX_VERTEX_BUFFER);
         if (pso_graphics_->mesh_only)
           EncodeBuffer(WMTRenderCommandSetMeshBuffer, Offset, SM50_BINDING_INDEX_VERTEX_BUFFER);
       }
-      if (Stride && vertex)
+      if (Stride && vertex && !Native)
         EncodeBuffer(WMTRenderCommandSetVertexBuffer, Offset, SM50_BINDING_INDEX_VERTEX_BUFFER);
+      hull_bound_.vertex_buffers = Offset;
       dirty_state_.clr(DirtyState::VertexBuffer);
     }
 
     if (dirty_state_.test(DirtyState::GraphicsRootArguments) && !SkipResourceBinding) {
-      if (rootsig_graphics_)
-        geometry_buffer(
-            EncodeRootArgument(rootsig_graphics_.ptr(), rootarg_graphics_staging_), SM50_BINDING_INDEX_ROOT_ARGUMENTS
-        );
+      if (rootsig_graphics_) {
+        auto uploaded =
+            UploadRootArguments(rootsig_graphics_.ptr(), rootarg_graphics_staging_, rootarg_graphics_uploaded_);
+        // the offset holds in the buffer the hull kernels bind too: each of the allocator's covers those before it
+        hull_bound_.root_arguments = uploaded.offset;
+        geometry_buffer(uploaded.offset, SM50_BINDING_INDEX_ROOT_ARGUMENTS, uploaded.buffer);
+      }
       dirty_state_.clr(DirtyState::GraphicsRootArguments);
     }
 
     if (dirty_state_.test(DirtyState::GraphicsRootSignature) && !SkipResourceBinding) {
       if (rootsig_graphics_)
-        geometry_buffer(EncodeStaticSamplers(rootsig_graphics_.ptr()), SM50_BINDING_INDEX_STATIC_SAMPLERS);
+        geometry_buffer(
+            hull_bound_.static_samplers = EncodeStaticSamplers(rootsig_graphics_.ptr()), SM50_BINDING_INDEX_STATIC_SAMPLERS
+        );
       dirty_state_.clr(DirtyState::GraphicsRootSignature);
     }
 
@@ -1613,18 +1656,20 @@ public:
 
   // a tessellated draw runs each group of patches in one object threadgroup of 32 threads (airconv's layout), which
   // reads the draw's D3D12 arguments (their layout is the one it expects) and its TessellationInputs; the view of a
-  // draw without indices is empty
+  // draw without indices is empty. a `Fallback` draw follows a native one on the compute tessellator, whose scan writes
+  // the word it counts patches from
   template <typename Arguments>
-  void
-  EncodeTessellationDraw(const Arguments &Args, uint32_t Count, uint32_t ControlPoints, const D3D12_INDEX_BUFFER_VIEW &View) {
+  uint32_t
+  EncodeTessellationDraw(const Arguments &Args, uint32_t Count, uint32_t ControlPoints, const D3D12_INDEX_BUFFER_VIEW &View,
+                         bool Fallback = false) {
     auto patches = ControlPoints ? Count / ControlPoints : 0, per_group = 32 / pso_graphics_->threads_per_patch;
     if (!patches || !Args.InstanceCount)
-      return;
+      return 0;
     TessellationInputs inputs{View, ControlPoints};
     auto [Mapped, Offset] = allocator_->AllocateGPUHeap(sizeof(inputs) + sizeof(Args), 16);
     if (allocator_->records_)
       allocator_->RecordGPUHeap(Mapped, sizeof(inputs) + sizeof(Args), "tessellation inputs", sizeof(inputs),
-                                predication_region_ ? sizeof(uint32_t) : 0);
+                                predication_region_ || Fallback ? sizeof(uint32_t) : 0);
     memcpy(Mapped, &inputs, sizeof(inputs));
     memcpy(reinterpret_cast<char *>(Mapped) + sizeof(inputs), &Args, sizeof(Args));
     // the object stage counts patches from the arguments' first word, so a skipped draw has none
@@ -1644,6 +1689,188 @@ public:
     cmd.patch_per_group = per_group;
     cmd.patch_per_mesh_instance = (patches + per_group - 1) / per_group;
     cmd.parts = pso_graphics_->tessellation_parts;
+    // the word the object stage counts patches from
+    return uint32_t((Offset + sizeof(inputs)) / sizeof(uint32_t));
+  }
+
+  // what the pass's hull kernels read of the state its draws bind: the last root arguments, static samplers and vertex
+  // buffer table, in the GPU heap; and whether the pipeline bound is Metal's tessellator's
+  struct {
+    uint64_t root_arguments, static_samplers, vertex_buffers;
+  } hull_bound_{};
+  bool native_bound_ = false;
+
+  // the state of the mesh draw that follows a native one on the compute tessellator, in the native draw's pass: the
+  // pass's end copies the native draw's record, which says that a mesh draw follows only once that is encoded. or of
+  // the mesh draw that draws a whole draw whose hull buffers had no room, which no record waits for
+  bool
+  FallbackPreDraw() {
+    auto pass = allocator_->encoder_current;
+    if (PreDraw() == DrawCallStatus::Invalid)
+      return false;
+    assert(!tessellation_draw_ || allocator_->encoder_current == pass);
+    return true;
+  }
+
+  // whether a draw takes Metal's tessellator: one direct draw of a pipeline that has it, with no pipeline statistics
+  // to count, which Metal does not count after its tessellator
+  bool
+  Native() {
+    // of the pipeline the draw takes, whose tessellator's kernel is made with it (DeferredPipeline)
+    TakeFuller();
+    if (!pso_graphics_)
+      return false;
+    pso_graphics_->WaitPipeline();
+    return pso_graphics_->hull && active_statistics_.empty();
+  }
+
+  // a sampler that needs what the pipeline leaves out may have come since it was set (MTLD3D12PipelineState::left_out)
+  void
+  TakeFuller() {
+    while (pso_graphics_ && (pso_graphics_->left_out & device_->sampler_emulations)) {
+      pso_graphics_ = static_cast<MTLD3D12GraphicsPipelineState *>(pso_graphics_->Fuller(device_));
+      dirty_state_.set(DirtyState::GraphicsPipelineState);
+    }
+  }
+
+  // a draw on Metal's tessellator: its hull kernel runs in the work before the pass (as the resolvers of indirect
+  // draws do), with what the pass binds its draws, and writes each instance's groups of patches after a header that
+  // holds their count, and each patch slot's factors, for the patch draw to read. the kernel reads the draw's D3D12
+  // arguments and TessellationInputs as EncodeTessellationDraw's object stage does
+  template <typename Arguments>
+  bool
+  EncodeNativeTessellationDraw(const Arguments &Args, uint32_t Count, uint32_t ControlPoints, const D3D12_INDEX_BUFFER_VIEW &View) {
+    auto per_group = 32 / pso_graphics_->threads_per_patch;
+    auto patches = ControlPoints ? Count / ControlPoints : 0, groups = (patches + per_group - 1) / per_group;
+    if (!patches || !Args.InstanceCount)
+      return false;
+    TessellationInputs inputs{View, ControlPoints};
+    uint64_t group_bytes = uint64_t(groups) * pso_graphics_->patch_group_size * Args.InstanceCount;
+    uint64_t factor_stride = uint64_t(groups) * per_group * pso_graphics_->patch_factor_size;
+    tessellation_draw_ = nullptr;
+    // the hull kernel's groups and factors grow with the draw's patches, where its mesh draw holds none of them: when
+    // the recording arena has no room for them, that draws the whole draw instead of the list being cut off
+    auto [header, patches_offset] = allocator_->AllocateGPUHeap(SM50_TESSELLATION_HEADER + group_bytes, 16, false);
+    auto [factors, factors_offset] =
+        allocator_->AllocateGPUHeap(factor_stride * Args.InstanceCount, sizeof(uint32_t), false);
+    if (!header || !factors)
+      return true;
+    auto [mapped, offset] = allocator_->AllocateGPUHeap(sizeof(inputs) + sizeof(Args), 16);
+    if (!mapped)
+      return false;
+    if (allocator_->records_) {
+      allocator_->RecordGPUHeap(mapped, sizeof(inputs) + sizeof(Args), "tessellation inputs", sizeof(inputs),
+                                predication_region_ ? sizeof(uint32_t) : 0);
+      allocator_->RecordGPUHeap(header, SM50_TESSELLATION_HEADER, "tessellation patch groups");
+    }
+    memcpy(mapped, &inputs, sizeof(inputs));
+    memcpy(reinterpret_cast<char *>(mapped) + sizeof(inputs), &Args, sizeof(Args));
+    *static_cast<uint32_t *>(header) = groups;
+    // a skipped draw has no patches: the kernel culls each patch it has no arguments for
+    if (predication_region_)
+      predicated_.push_back({uint32_t((offset + sizeof(inputs)) / 4), reinterpret_cast<const uint32_t *>(&Args)[0], 0});
+
+    auto &setpso = allocator_->EncodeBeforeRender<wmtcmd_compute_setpso>();
+    setpso.type = WMTComputeCommandSetPSO;
+    setpso.pso = pso_graphics_->hull;
+    setpso.threadgroup_size = {pso_graphics_->threads_per_patch, per_group, 1};
+    std::pair<uint64_t, uint8_t> buffers[] = {
+        {hull_bound_.root_arguments, SM50_BINDING_INDEX_ROOT_ARGUMENTS},
+        {hull_bound_.static_samplers, SM50_BINDING_INDEX_STATIC_SAMPLERS},
+        {hull_bound_.vertex_buffers, SM50_BINDING_INDEX_VERTEX_BUFFER},
+        {offset, SM50_BINDING_INDEX_INDEX_BUFFER},
+        {offset + offsetof(TessellationInputs, control_points), SM50_BINDING_INDEX_PATCH_SIZE},
+        {offset + sizeof(inputs), SM50_BINDING_INDEX_DRAW_ARGUMENTS},
+        {patches_offset, SM50_BINDING_INDEX_TESSELLATION_PATCHES},
+        {factors_offset, SM50_BINDING_INDEX_TESSELLATION_FACTORS},
+    };
+    for (auto [at, index] : buffers) {
+      auto &set = allocator_->EncodeBeforeRender<wmtcmd_compute_setbuffer>();
+      set.type = WMTComputeCommandSetBuffer;
+      set.buffer = allocator_->gpu_heap_buffer_;
+      set.offset = at;
+      set.index = index;
+    }
+    auto &dispatch = allocator_->EncodeBeforeRender<wmtcmd_compute_dispatch>();
+    dispatch.type = WMTComputeCommandDispatch;
+    dispatch.size = {groups, Args.InstanceCount, 1};
+
+    EncodeBuffer(WMTRenderCommandSetVertexBuffer, patches_offset, SM50_BINDING_INDEX_TESSELLATION_PATCHES);
+    if (pso_graphics_->compute_tessellation)
+      return EncodeComputeTessellation(
+          groups * per_group * Args.InstanceCount, patches * Args.InstanceCount, factors_offset, offset + sizeof(inputs)
+      );
+    auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_draw_patches>();
+    cmd.type = WMTRenderCommandDrawPatches;
+    cmd.factor_buffer = allocator_->gpu_heap_buffer_;
+    cmd.factor_buffer_offset = factors_offset;
+    cmd.factor_instance_stride = factor_stride;
+    // the domain shader reads its patch's control points from the hull kernel's groups, none as Metal's stage input
+    cmd.control_points = 0;
+    cmd.patch_count = patches;
+    cmd.instance_count = Args.InstanceCount;
+    return false;
+  }
+
+  // the draw just recorded for the pass's compute tessellator
+  TessellationBatch::Draw *tessellation_draw_ = nullptr;
+
+  // a draw's patch slots on the compute tessellator (TessellationPass), `Patches` of them real: recorded for the pass's
+  // tessellation, and drawn from its points and indices by the arguments its scan writes. true when the pass's arena
+  // may have no room for them: a mesh draw must then follow, which draws them where the arena has not, counting
+  // patches from the word that `Source`, the draw's own count, is copied to
+  bool
+  EncodeComputeTessellation(uint32_t Slots, uint32_t Patches, uint64_t Factors, uint64_t Source) {
+    auto render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
+    auto words = [](uint64_t offset) { return uint32_t(offset / sizeof(uint32_t)); };
+    auto &batch = render->tessellation;
+    if (!batch) {
+      batch = new (allocator_->AllocateCPUHeap(sizeof(TessellationBatch), alignof(TessellationBatch))) TessellationBatch();
+      batch->heap = obj_handle_t(allocator_->gpu_heap_buffer_);
+      batch->slot_points = device_->tessellation_slot_points;
+      batch->slot_indices = device_->tessellation_slot_indices;
+      batch->pass_points = device_->tessellation_pass_points;
+      batch->pass_indices = device_->tessellation_pass_indices;
+    }
+    auto [arguments, arguments_offset] = allocator_->AllocateGPUHeap(5 * sizeof(uint32_t), 16);
+    auto draw = new (allocator_->AllocateCPUHeap(sizeof(TessellationBatch::Draw), alignof(TessellationBatch::Draw)))
+        TessellationBatch::Draw{};
+    // nothing drawn until the scan writes them
+    std::array<uint32_t, 5> none{0, 1, 0, 0, 0};
+    memcpy(arguments, none.data(), sizeof(none));
+    draw->record = {batch->patches, Slots, words(Factors), pso_graphics_->tessellation_kind, words(arguments_offset), 0,
+                    words(Source)};
+    *batch->last = tessellation_draw_ = draw;
+    batch->last = &draw->next;
+    batch->draws++;
+    batch->patches += Slots;
+    // the most a patch makes whatever its factors: fewer than (factor + 3)^2 points and twice as many triangles
+    uint64_t side = pso_graphics_->tessellation_factor + 3;
+    batch->most_points += Patches * side * side;
+    batch->most_indices += Patches * 6 * side * side;
+    // the indices number the points from the heap's start. FinishTessellation places the arena and names the buffer
+    // that covers it, which a longer one than this may be by then: a binding of its own, not one EncodeBuffer keeps
+    auto &points = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+    points.type = WMTRenderCommandSetVertexBuffer;
+    points.buffer = allocator_->gpu_heap_buffer_;
+    points.offset = 0;
+    points.index = SM50_BINDING_INDEX_TESSELLATION_POINTS;
+    if (bound_.pass == allocator_->encoder_current)
+      bound_.buffer[0][SM50_BINDING_INDEX_TESSELLATION_POINTS] = 0;
+    draw->points = &points;
+    auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indexed_indirect>();
+    cmd.type = WMTRenderCommandDrawIndexedIndirect;
+    cmd.primitive_type = WMTPrimitiveTypeTriangle;
+    cmd.index_type = WMTIndexTypeUInt32;
+    cmd.index_buffer = allocator_->gpu_heap_buffer_;
+    draw->indexed = &cmd;
+    cmd.indirect_args_buffer = allocator_->gpu_heap_buffer_;
+    cmd.indirect_args_offset = arguments_offset;
+    // the slots after it only add room
+    return batch->most_points > batch->Room(batch->slot_points, batch->pass_points, batch->most_points,
+                                            device_->kTessellationMostPoints) ||
+           batch->most_indices > batch->Room(batch->slot_indices, batch->pass_indices, batch->most_indices,
+                                             device_->kTessellationMostIndices);
   }
 
   static bool
@@ -1673,12 +1900,16 @@ public:
   RenderTargets(WMT::RenderPipelineState Pipeline) {
     auto pass = static_cast<RenderEncoderData *>(allocator_->encoder_current);
     uint32_t mask = 0;
+    WMTPixelFormat colors[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
     for (unsigned i = 0; i < std::size(pass->colors); i++)
-      if (pass->colors[i].attachment)
+      if (pass->colors[i].attachment) {
         mask |= 1u << i;
+        if (rtvs[i].Texture)
+          colors[i] = rtvs[i].Texture->pixelFormat(rtvs[i].View);
+      }
     return pso_graphics_->RenderTargets(
         Pipeline, mask, pass->dsv_planar_flags, !active_statistics_.empty(), !active_queries_.empty(), CoarseShading(),
-        dsv.Texture ? dsv.Texture->pixelFormat(dsv.View) : WMTPixelFormatInvalid
+        dsv.Texture ? dsv.Texture->pixelFormat(dsv.View) : WMTPixelFormatInvalid, colors
     );
   }
 
@@ -1690,9 +1921,9 @@ public:
     bool strip = Strip(topology_);
     if (PassesAdjacency() || pso_graphics_->patches)
       return RenderTargets(pso_graphics_->TopologyPipeline(topology_, counting));
-    if (counting)
-      return RenderTargets(strip ? pso_graphics_->so_count_strip : pso_graphics_->so_count);
-    return RenderTargets(pso_graphics_->geometry_shader && strip ? pso_graphics_->pso_strip : pso_graphics_->pso);
+    if (pso_graphics_->geometry_shader && (strip || counting))
+      return RenderTargets(pso_graphics_->GeometryPipeline(strip, counting));
+    return RenderTargets(pso_graphics_->pso);
   }
 
   // whether the draw's pipeline is a mesh function alone, which runs the vertex shader in the mesh stage: a list of
@@ -1856,10 +2087,21 @@ public:
     uint32_t cp_count;
     if (!to_metal_primitive_type(topology_, primitive_type, cp_count))
       return;
-    DrawCallStatus status = PreDraw(false, true);
+    bool native = pso_graphics_ && Native();
+    DrawCallStatus status = PreDraw(false, native);
     if (status == DrawCallStatus::Invalid)
       return;
     CountDraw(VertexCountPerInstance, InstanceCount);
+    if (native) {
+      D3D12_DRAW_ARGUMENTS args{VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation};
+      // where the pass's compute tessellator may have no room, its mesh draw follows
+      if (EncodeNativeTessellationDraw(args, VertexCountPerInstance, cp_count, {}) && FallbackPreDraw()) {
+        auto fallback = EncodeTessellationDraw(args, VertexCountPerInstance, cp_count, {}, true);
+        if (tessellation_draw_)
+          tessellation_draw_->record.fallback = fallback;
+      }
+      return;
+    }
     if (pso_graphics_->threads_per_patch) {
       EncodeTessellationDraw(
           D3D12_DRAW_ARGUMENTS{VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation},
@@ -1908,10 +2150,23 @@ public:
     uint32_t cp_count;
     if (!to_metal_primitive_type(topology_, primitive_type, cp_count))
       return;
-    DrawCallStatus status = PreDraw();
+    bool native = pso_graphics_ && Native();
+    DrawCallStatus status = PreDraw(false, native);
     if (status == DrawCallStatus::Invalid)
       return;
     CountDraw(IndexCountPerInstance, InstanceCount, true, StartVertexLocation);
+    if (native) {
+      D3D12_DRAW_INDEXED_ARGUMENTS args{
+          IndexCountPerInstance, InstanceCount, StartVertexLocation, BaseVertexLocation, StartInstanceLocation
+      };
+      if (EncodeNativeTessellationDraw(args, IndexCountPerInstance, cp_count, IndexedView(index_view_)) &&
+          FallbackPreDraw()) {
+        auto fallback = EncodeTessellationDraw(args, IndexCountPerInstance, cp_count, IndexedView(index_view_), true);
+        if (tessellation_draw_)
+          tessellation_draw_->record.fallback = fallback;
+      }
+      return;
+    }
     if (pso_graphics_->threads_per_patch) {
       EncodeTessellationDraw(
           D3D12_DRAW_INDEXED_ARGUMENTS{
@@ -1981,18 +2236,19 @@ public:
   };
 
   uint64_t
-  EncodeRootArgument(
-      MTLD3D12RootSignature *pRootSig, uint64_t const pStaging[64], UINT Count = 1, bool Written = false
-  ) {
-    auto [Ptr, Offset] = allocator_->AllocateGPUHeap(sizeof(uint64_t) * pRootSig->UploadQwords * Count, 64);
-    if (allocator_->records_ && !Written)
-      allocator_->RecordGPUHeap(Ptr, sizeof(uint64_t) * pRootSig->UploadQwords * Count, "root argument table");
-    for (unsigned i = 0; i < Count; i++)
-      memcpy(
-          reinterpret_cast<uint64_t *>(Ptr) + i * pRootSig->UploadQwords, pStaging,
-          pRootSig->UploadQwords * sizeof(uint64_t)
-      );
+  EncodeRootArgument(MTLD3D12RootSignature *pRootSig, uint64_t const pStaging[64]) {
+    auto [Ptr, Offset] = allocator_->AllocateGPUHeap(sizeof(uint64_t) * pRootSig->UploadQwords, 64);
+    if (allocator_->records_)
+      allocator_->RecordGPUHeap(Ptr, sizeof(uint64_t) * pRootSig->UploadQwords, "root argument table");
+    memcpy(Ptr, pStaging, pRootSig->UploadQwords * sizeof(uint64_t));
     return Offset;
+  }
+
+  // room for the root arguments of each of `Count` commands of an ExecuteIndirect whose signature changes some: its
+  // resolver writes those of the commands it runs, on the GPU, so recording copies nothing for a command
+  uint64_t
+  ReserveRootArguments(MTLD3D12RootSignature *pRootSig, UINT Count) {
+    return std::get<1>(allocator_->AllocateGPUHeap(sizeof(uint64_t) * pRootSig->UploadQwords * Count, 64));
   }
 
   uint64_t
@@ -2056,11 +2312,12 @@ public:
   BindComputeRootArguments(bool SkipResourceBinding = false) {
     if (dirty_state_.test(DirtyState::ComputeRootArguments) && !SkipResourceBinding) {
       if (rootsig_compute_) {
-        auto Offset = EncodeRootArgument(rootsig_compute_.ptr(), rootarg_compute_staging_);
+        auto uploaded =
+            UploadRootArguments(rootsig_compute_.ptr(), rootarg_compute_staging_, rootarg_compute_uploaded_);
         auto &cmd_argbuf = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
         cmd_argbuf.type = WMTComputeCommandSetBuffer;
-        cmd_argbuf.buffer = allocator_->gpu_heap_buffer_;
-        cmd_argbuf.offset = Offset;
+        cmd_argbuf.buffer = uploaded.buffer;
+        cmd_argbuf.offset = uploaded.offset;
         cmd_argbuf.index = SM50_BINDING_INDEX_ROOT_ARGUMENTS;
       }
       dirty_state_.clr(DirtyState::ComputeRootArguments);
@@ -2802,11 +3059,6 @@ public:
   SetPipelineState(ID3D12PipelineState *pPSO) {
     if (Bundled() && Record([pso = Com<ID3D12PipelineState>(pPSO)](auto *l) { l->SetPipelineState(pso.ptr()); }))
       return;
-    // setting a pipeline state again takes its depth bias back, the same one included
-    if (depth_bias_) {
-      depth_bias_.reset();
-      dirty_state_.set(DirtyState::GraphicsPipelineState);
-    }
     if (!pPSO) {
       pso_graphics_ = nullptr;
       pso_compute_ = nullptr;
@@ -2830,6 +3082,9 @@ public:
       return;
     if (!pso_graphics_ || pso_graphics_->viewport_array_index != graphics_pso->viewport_array_index)
       dirty_state_.set(DirtyState::Viewport, DirtyState::ScissorRect);
+    // another pipeline takes RSSetDepthBias's values back; the one that is set keeps them, as on Windows
+    // (vkd3d-proton's test_dynamic_depth_bias, which has the specification take them back there too)
+    depth_bias_.reset();
     // tessellation, geometry shaders and stream output bind root arguments to other stages
     // and a pipeline whose mesh stage reads them, or reads the vertex buffers (mesh_only), to others again
     auto stages = [&](MTLD3D12GraphicsPipelineState *p) {
@@ -2896,30 +3151,12 @@ public:
 
   void STDMETHODCALLTYPE ResourceBarrier(UINT Count, const D3D12_RESOURCE_BARRIER *barriers) {
     WriteMarkers();
-    auto open = allocator_->encoder_current;
-    bool fragment_only = Count && plain_pass_ && plain_pass_->type == EncoderType::Render &&
-                         (open ? open : allocator_->encoder_last) == plain_pass_ &&
-                         std::ranges::all_of(std::span(barriers, Count), [](const auto &barrier) {
-      if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || barrier.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE)
-        return false;
-      const auto &transition = barrier.Transition;
-      constexpr auto rt = D3D12_RESOURCE_STATE_RENDER_TARGET, ps = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-      if (!transition.pResource || transition.Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES ||
-          !((transition.StateBefore == rt && transition.StateAfter == ps) ||
-            (transition.StateBefore == ps && transition.StateAfter == rt)))
-        return false;
-      const auto &texture = static_cast<MTLD3D12Resource *>(transition.pResource)->texture;
-      if (!texture || !texture->current())
-        return false;
-      auto flags = texture->current()->flags();
-      const auto &info = texture->info();
-      return info.type == WMTTextureType2D && !info.placement_sparse_page_size && !texture->render_buffer &&
-             flags.test(TextureAllocationFlag::GpuPrivate) &&
-             !flags.any(TextureAllocationFlag::AllocatedOnHeap, TextureAllocationFlag::Shared);
-    });
-    MarkOrderingPoint();
-    if (!fragment_only)
-      full_order_serial_ = order_serial_;
+    constexpr auto pixels = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_DEPTH_WRITE |
+                            D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    OrderingPoint(std::ranges::any_of(std::span(barriers, Count), [&](auto &barrier) {
+      auto after = barrier.Transition.StateAfter;
+      return barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || !after || (after & ~pixels);
+    }));
     constexpr auto uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS, draw_writes = uav | D3D12_RESOURCE_STATE_RENDER_TARGET |
                        D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_STREAM_OUT;
     // Metal orders passes that reach one memory through a reserved buffer and through another resource only with
@@ -2965,10 +3202,6 @@ public:
       ordered = Order(other || ((states.StateBefore & draw_writes) && PassWrote(states.pResource)),
                       other || ((states.StateBefore | states.StateAfter) & uav));
     }
-    // A barrier ending this encoder only orders later passes. When it leaves the encoder open, later draws may
-    // need an earlier wait than the draws recorded before the barrier did.
-    if (open && allocator_->encoder_current == open)
-      RequireFullOrder();
   };
 
   void STDMETHODCALLTYPE
@@ -3002,10 +3235,13 @@ public:
       rootsig_compute_ = static_cast<MTLD3D12RootSignature *>(pRootSignature);
       assert(rootsig_compute_->UploadQwords <= std::size(rootarg_compute_staging_));
       WriteHeapArguments(rootsig_compute_.ptr(), rootarg_compute_staging_, DirtyState::ComputeRootArguments);
+      NullRootViews(rootsig_compute_.ptr(), rootarg_compute_staging_, DirtyState::ComputeRootArguments);
     } else {
       rootsig_compute_ = nullptr;
     }
-    dirty_state_.set(DirtyState::ComputeRootArguments, DirtyState::ComputeRootSignature);
+    // another root signature uploads another number of arguments
+    RootArgumentsChanged(DirtyState::ComputeRootArguments);
+    dirty_state_.set(DirtyState::ComputeRootSignature);
   };
 
   void STDMETHODCALLTYPE
@@ -3018,10 +3254,13 @@ public:
       rootsig_graphics_ = static_cast<MTLD3D12RootSignature *>(pRootSignature);
       assert(rootsig_graphics_->UploadQwords <= std::size(rootarg_graphics_staging_));
       WriteHeapArguments(rootsig_graphics_.ptr(), rootarg_graphics_staging_, DirtyState::GraphicsRootArguments);
+      NullRootViews(rootsig_graphics_.ptr(), rootarg_graphics_staging_, DirtyState::GraphicsRootArguments);
     } else {
       rootsig_graphics_ = nullptr;
     }
-    dirty_state_.set(DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
+    // another root signature uploads another number of arguments
+    RootArgumentsChanged(DirtyState::GraphicsRootArguments);
+    dirty_state_.set(DirtyState::GraphicsRootSignature);
   };
 
   // a root argument that changes dirties the arguments, which the next draw or dispatch uploads again; one set to what
@@ -3034,7 +3273,7 @@ public:
     if (slot == Value)
       return;
     slot = Value;
-    dirty_state_.set(dirty);
+    RootArgumentsChanged(dirty);
   }
 
   void
@@ -3044,11 +3283,17 @@ public:
   ) {
     if (!rootsig || Index >= rootsig->ParameterSlots)
       return;
+    // values past the parameter's own are another parameter's arguments, or past them all: Direct3D does not define
+    // setting them, and they are left as they are, as is a parameter that is not constants
+    auto values = rootsig->SlotConstants[Index];
+    if (DstOffset >= values)
+      return;
+    Count = std::min(Count, values - DstOffset);
     auto dst = reinterpret_cast<uint32_t *>(staging + rootsig->SlotQwordOffsets[Index]) + DstOffset;
     if (!memcmp(dst, Data, Count * sizeof(uint32_t)))
       return;
     memcpy(dst, Data, Count * sizeof(uint32_t));
-    dirty_state_.set(dirty);
+    RootArgumentsChanged(dirty);
   }
 
   void STDMETHODCALLTYPE SetComputeRootDescriptorTable(UINT Index, D3D12_GPU_DESCRIPTOR_HANDLE BaseDescriptor) {
@@ -3094,14 +3339,20 @@ public:
   void STDMETHODCALLTYPE SetComputeRootConstantBufferView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
     if (Bundled() && Record([=](auto *l) { l->SetComputeRootConstantBufferView(Index, VA); }))
       return;
-    SetRootQword(rootsig_compute_.ptr(), rootarg_compute_staging_, DirtyState::ComputeRootArguments, Index, VA);
+    SetRootQword(
+        rootsig_compute_.ptr(), rootarg_compute_staging_, DirtyState::ComputeRootArguments, Index,
+        VA ? VA : device_->GetNullBuffer()
+    );
   };
 
   void STDMETHODCALLTYPE
   SetGraphicsRootConstantBufferView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
     if (Bundled() && Record([=](auto *l) { l->SetGraphicsRootConstantBufferView(Index, VA); }))
       return;
-    SetRootQword(rootsig_graphics_.ptr(), rootarg_graphics_staging_, DirtyState::GraphicsRootArguments, Index, VA);
+    SetRootQword(
+        rootsig_graphics_.ptr(), rootarg_graphics_staging_, DirtyState::GraphicsRootArguments, Index,
+        VA ? VA : device_->GetNullBuffer()
+    );
   };
 
   void STDMETHODCALLTYPE SetComputeRootShaderResourceView(UINT Index, D3D12_GPU_VIRTUAL_ADDRESS VA) {
@@ -3462,6 +3713,50 @@ public:
     }
   };
 
+  // the rectangles of a UAV clear that ClearUAV has begun, or the whole view with none, and the clear's end. a
+  // rectangle counts a buffer's elements, and the kernel the buffer's words or the view's texels from the start of
+  // the buffer: the view's first is kept in 64 bits, as a view may start 4 GiB or more into a buffer
+  void
+  ClearUAVRectangles(const ShaderVisibleDescriptorCPUStorage &Descriptor, UINT RectCount, const D3D12_RECT *pRects) {
+    uint64_t first = 0;
+    int64_t width = 0, height = 1;
+    UINT element_stride = 1, first_slice = 0, slice_count = 0;
+    switch (Descriptor.type) {
+    case ShaderVisibleDescriptorType::UAVBuffer: {
+      auto &slice = Descriptor.UAVBuffer.slice;
+      element_stride = slice.byteLength / (slice.elementCount * sizeof(uint32_t));
+      first = slice.byteOffset / sizeof(uint32_t);
+      width = slice.byteLength / sizeof(uint32_t) / element_stride;
+      break;
+    }
+    case ShaderVisibleDescriptorType::UAVTexture:
+      first_slice = Descriptor.UAVTexture.first_slice;
+      slice_count = Descriptor.UAVTexture.slice_count;
+      width = Descriptor.UAVTexture.texture->width(Descriptor.UAVTexture.view);
+      height = Descriptor.UAVTexture.texture->height(Descriptor.UAVTexture.view);
+      break;
+    case ShaderVisibleDescriptorType::UAVTexelBuffer:
+      first = Descriptor.UAVTexelBuffer.slice.firstElement;
+      width = Descriptor.UAVTexelBuffer.slice.elementCount;
+      break;
+    default:
+      break;
+    }
+    for (UINT i = 0; i < std::max(RectCount, 1u); i++) {
+      int64_t left = 0, top = 0, right = width, bottom = height;
+      if (RectCount) {
+        left = std::max<int64_t>(pRects[i].left, 0), top = std::max<int64_t>(pRects[i].top, 0);
+        right = std::min<int64_t>(pRects[i].right, width), bottom = std::min<int64_t>(pRects[i].bottom, height);
+      }
+      if (right <= left || bottom <= top)
+        continue;
+      allocator_->clear_uav_.clear(
+          first + left * element_stride, top, (right - left) * element_stride, bottom - top, first_slice, slice_count
+      );
+    }
+    allocator_->clear_uav_.end();
+  }
+
   void STDMETHODCALLTYPE
   ClearUnorderedAccessViewUint(
       D3D12_GPU_DESCRIPTOR_HANDLE GpuHandle, D3D12_CPU_DESCRIPTOR_HANDLE CpuHandle, ID3D12Resource *pResource,
@@ -3489,61 +3784,21 @@ public:
         BlitNaNClear(Descriptor.UAVTexture, color, RectCount, pRects))
       return;
     SharedComputePass shared(this);
-    D3D12_RECT full_rect;
-    UINT element_stride = 1, first_slice = 0, slice_count = 0;
     switch (Descriptor.type) {
-    case ShaderVisibleDescriptorType::UAVBuffer: {
+    case ShaderVisibleDescriptorType::UAVBuffer:
       allocator_->clear_uav_.begin(color, Descriptor.UAVBuffer.buffer);
-      element_stride = Descriptor.UAVBuffer.slice.byteLength /
-                       (Descriptor.UAVBuffer.slice.elementCount * sizeof(uint32_t));
-      full_rect = {
-          (LONG)Descriptor.UAVBuffer.slice.byteOffset >> 2, 0,
-          (LONG)((Descriptor.UAVBuffer.slice.byteOffset + Descriptor.UAVBuffer.slice.byteLength) >> 2), 1
-      };
       break;
-    }
-    case ShaderVisibleDescriptorType::UAVTexture: {
+    case ShaderVisibleDescriptorType::UAVTexture:
       allocator_->clear_uav_.begin(color, Descriptor.UAVTexture.texture, Descriptor.UAVTexture.view);
-      first_slice = Descriptor.UAVTexture.first_slice;
-      slice_count = Descriptor.UAVTexture.slice_count;
-      full_rect = {
-          0, 0, (LONG)Descriptor.UAVTexture.texture->width(Descriptor.UAVTexture.view),
-          (LONG)Descriptor.UAVTexture.texture->height(Descriptor.UAVTexture.view)
-      };
       break;
-    }
-    case ShaderVisibleDescriptorType::UAVTexelBuffer: {
+    case ShaderVisibleDescriptorType::UAVTexelBuffer:
       allocator_->clear_uav_.begin(color, Descriptor.UAVTexelBuffer.buffer, Descriptor.UAVTexelBuffer.view);
-      full_rect = {
-          (LONG)Descriptor.UAVTexelBuffer.slice.firstElement, 0,
-          (LONG)(Descriptor.UAVTexelBuffer.slice.firstElement + Descriptor.UAVTexelBuffer.slice.elementCount), 1
-      };
       break;
-    }
     default:
       allocator_->clear_uav_.end();
       return;
     }
-
-    const D3D12_RECT *rects = RectCount > 0 ? pRects : &full_rect;
-    UINT rect_count = RectCount > 0 ? RectCount : 1;
-
-    for (unsigned i = 0; i < rect_count; i++) {
-      auto &rect = rects[i];
-      auto left = RectCount ? std::max<int64_t>(rect.left, 0) : 0;
-      auto top = std::max<int64_t>(rect.top, 0);
-      auto right = RectCount ? std::min<int64_t>(rect.right, (full_rect.right - full_rect.left) / element_stride)
-                             : (full_rect.right - full_rect.left) / element_stride;
-      auto bottom = std::min<int64_t>(rect.bottom, full_rect.bottom);
-      if (right <= left || bottom <= top)
-        continue;
-      allocator_->clear_uav_.clear(
-          full_rect.left + left * element_stride, top, (right - left) * element_stride, bottom - top,
-          first_slice, slice_count
-      );
-    }
-
-    allocator_->clear_uav_.end();
+    ClearUAVRectangles(Descriptor, RectCount, pRects);
   };
 
   void STDMETHODCALLTYPE
@@ -3565,61 +3820,21 @@ public:
         FillBufferClear(Descriptor.UAVBuffer, std::bit_cast<uint32_t>(color[0]), RectCount, pRects))
       return;
     SharedComputePass shared(this);
-    D3D12_RECT full_rect;
-    UINT element_stride = 1, first_slice = 0, slice_count = 0;
     switch (Descriptor.type) {
-    case ShaderVisibleDescriptorType::UAVBuffer: {
+    case ShaderVisibleDescriptorType::UAVBuffer:
       allocator_->clear_uav_.begin(color, Descriptor.UAVBuffer.buffer);
-      element_stride = Descriptor.UAVBuffer.slice.byteLength /
-                       (Descriptor.UAVBuffer.slice.elementCount * sizeof(uint32_t));
-      full_rect = {
-          (LONG)Descriptor.UAVBuffer.slice.byteOffset >> 2, 0,
-          (LONG)((Descriptor.UAVBuffer.slice.byteOffset + Descriptor.UAVBuffer.slice.byteLength) >> 2), 1
-      };
       break;
-    }
-    case ShaderVisibleDescriptorType::UAVTexture: {
+    case ShaderVisibleDescriptorType::UAVTexture:
       allocator_->clear_uav_.begin(color, Descriptor.UAVTexture.texture, Descriptor.UAVTexture.view);
-      first_slice = Descriptor.UAVTexture.first_slice;
-      slice_count = Descriptor.UAVTexture.slice_count;
-      full_rect = {
-          0, 0, (LONG)Descriptor.UAVTexture.texture->width(Descriptor.UAVTexture.view),
-          (LONG)Descriptor.UAVTexture.texture->height(Descriptor.UAVTexture.view)
-      };
       break;
-    }
-    case ShaderVisibleDescriptorType::UAVTexelBuffer: {
+    case ShaderVisibleDescriptorType::UAVTexelBuffer:
       allocator_->clear_uav_.begin(color, Descriptor.UAVTexelBuffer.buffer, Descriptor.UAVTexelBuffer.view);
-      full_rect = {
-          (LONG)Descriptor.UAVTexelBuffer.slice.firstElement, 0,
-          (LONG)(Descriptor.UAVTexelBuffer.slice.firstElement + Descriptor.UAVTexelBuffer.slice.elementCount), 1
-      };
       break;
-    }
     default:
       allocator_->clear_uav_.end();
       return;
     }
-
-    const D3D12_RECT *rects = RectCount > 0 ? pRects : &full_rect;
-    UINT rect_count = RectCount > 0 ? RectCount : 1;
-
-    for (unsigned i = 0; i < rect_count; i++) {
-      auto &rect = rects[i];
-      auto left = RectCount ? std::max<int64_t>(rect.left, 0) : 0;
-      auto top = std::max<int64_t>(rect.top, 0);
-      auto right = RectCount ? std::min<int64_t>(rect.right, (full_rect.right - full_rect.left) / element_stride)
-                             : (full_rect.right - full_rect.left) / element_stride;
-      auto bottom = std::min<int64_t>(rect.bottom, full_rect.bottom);
-      if (right <= left || bottom <= top)
-        continue;
-      allocator_->clear_uav_.clear(
-          full_rect.left + left * element_stride, top, (right - left) * element_stride, bottom - top,
-          first_slice, slice_count
-      );
-    }
-
-    allocator_->clear_uav_.end();
+    ClearUAVRectangles(Descriptor, RectCount, pRects);
   };
 
   void STDMETHODCALLTYPE DiscardResource(ID3D12Resource *pResource, const D3D12_DISCARD_REGION *pRegion) {
@@ -3628,6 +3843,10 @@ public:
 
   void STDMETHODCALLTYPE
   BeginQuery(ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT Index) {
+    // a bundle's query is the calling list's: it counts that list's draws, the bundle's among them
+    if (Bundled() &&
+        Record([=, heap = Com<ID3D12QueryHeap>(pHeap)](auto *l) { l->BeginQuery(heap.ptr(), Type, Index); }))
+      return;
     OrderingPoint();
     // pipeline statistics count the draws and dispatches captured from here
     if (Type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS || Type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS1) {
@@ -3669,6 +3888,8 @@ public:
 
   void STDMETHODCALLTYPE
   EndQuery(ID3D12QueryHeap *pHeap, D3D12_QUERY_TYPE Type, UINT Index) {
+    if (Bundled() && Record([=, heap = Com<ID3D12QueryHeap>(pHeap)](auto *l) { l->EndQuery(heap.ptr(), Type, Index); }))
+      return;
     OrderingPoint();
     auto heap = static_cast<MTLD3D12QueryHeap *>(pHeap);
     if (Type >= D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 && Type <= D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3) {
@@ -3695,6 +3916,10 @@ public:
       return;
     }
     if (Type == D3D12_QUERY_TYPE_TIMESTAMP) {
+      // sampling one shapes the passes around it, which d3d12.timestampQueries=False leaves out: a profiler or a
+      // resolution scaler then reads zeros
+      if (!device_->timestamp_queries)
+        return;
       // the clock "at the instant that the GPU is finished with all the preceding workload" (D3D11.3 20.4.3): the
       // pass that work ends with samples it as it ends, a render pass or the pass of the query before. an open pass
       // goes on, and its end is the clock, later than the query but not by more than its own work, as MoltenVK's
@@ -3796,6 +4021,9 @@ public:
     SumOcclusion();
     SumStatistics();
     if (!heap->timestamps.empty()) {
+      // no query sampled: the destination keeps what it holds, and every interval read from it is zero
+      if (!device_->timestamp_queries)
+        return;
       allocator_->InvalidateCurrentPass();
       auto resolve = allocator_->AllocatePass<ResolveTimestampsData>();
       resolve->type = EncoderType::ResolveTimestamps;
@@ -3984,7 +4212,9 @@ public:
       uint64_t root_arguments = 0, static_samplers = 0;
 
       if (sig->UpdateRootArguments) {
-        root_arguments = EncodeRootArgument(rootsig_compute_.ptr(), rootarg_compute_staging_, MaxCommandCount, true);
+        cmd->rootsig_base = EncodeRootArgument(rootsig_compute_.ptr(), rootarg_compute_staging_);
+        cmd->rootsig_base += allocator_->gpu_heap_buffer_address_;
+        root_arguments = ReserveRootArguments(rootsig_compute_.ptr(), MaxCommandCount);
         cmd->rootsig_qwords = root_arguments;
         cmd->rootsig_qwords += allocator_->gpu_heap_buffer_address_;
         cmd->rootsig_qwords_stride = rootsig_compute_->UploadQwords;
@@ -4063,6 +4293,24 @@ public:
       IMPLEMENT_ME // TODO: (potential) emulated pipeline
     }
 
+    // a few commands that only draw, with no count for the GPU to read and nothing a resolver counts, are Metal's own
+    // indirect draws of the arguments where they are (they are D3D12_DRAW_ARGUMENTS, as in DrawInstanced): no
+    // resolver writing an indirect command buffer in a compute pass before this one, and the buffers stay bound. an
+    // indexed command stays with the resolver, which keeps its indices inside the view (D3D11.3 8.19.2), and Metal
+    // takes the arguments at a multiple of four bytes only
+    if (sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW && !encode_binding && !CountBufferAddress &&
+        !predication_region_ && active_statistics_.empty() && !diag::errors &&
+        MaxCommandCount <= kIndirectDrawsInPlace && !(ArgBufferOffset % sizeof(UINT))) {
+      for (UINT i = 0; i < MaxCommandCount; i++) {
+        auto &draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_indirect>();
+        draw.type = WMTRenderCommandDrawIndirect;
+        draw.primitive_type = primitive_type;
+        draw.indirect_args_buffer = arg_buffer->buffer->current()->buffer();
+        draw.indirect_args_offset = ArgBufferOffset + uint64_t(i) * sig->ByteStride;
+      }
+      return;
+    }
+
     uint64_t statistics = 0, pixel_statistics = 0;
     if (!active_statistics_.empty() && MaxCommandCount) {
       auto size = (uint64_t(MaxCommandCount) + 1) * sizeof(PipelineStatisticsResult);
@@ -4133,16 +4381,27 @@ public:
     }
     if (!encode_binding)
       return;
-    cmd->rootsig_qwords = EncodeRootArgument(
-        rootsig_graphics_.ptr(), rootarg_graphics_staging_, MaxCommandCount, sig->UpdateRootArguments
-    );
+    // a command has root arguments or a vertex buffer table of its own where the signature changes them: room for
+    // each, which the resolver fills from the list's one copy for the commands it runs (rootsig_base, vertex_base).
+    // the commands of a signature that does not read the list's copy, a stride of nothing apart
+    cmd->rootsig_qwords = EncodeRootArgument(rootsig_graphics_.ptr(), rootarg_graphics_staging_);
     cmd->rootsig_qwords += allocator_->gpu_heap_buffer_address_;
-    cmd->rootsig_qwords_stride = rootsig_graphics_->UploadQwords;
+    if (sig->UpdateRootArguments) {
+      cmd->rootsig_base = cmd->rootsig_qwords;
+      cmd->rootsig_qwords = ReserveRootArguments(rootsig_graphics_.ptr(), MaxCommandCount);
+      cmd->rootsig_qwords += allocator_->gpu_heap_buffer_address_;
+      cmd->rootsig_qwords_stride = rootsig_graphics_->UploadQwords;
+    }
     cmd->static_samplers = EncodeStaticSamplers(rootsig_graphics_.ptr());
     cmd->static_samplers += allocator_->gpu_heap_buffer_address_;
-    auto [VBOffset, VBStride] = PopulateVertexBufferTable(MaxCommandCount, sig->UpdateVertexBuffers);
+    auto [VBOffset, VBStride] = PopulateVertexBufferTable();
     cmd->vertex_buffer = allocator_->gpu_heap_buffer_address_ + VBOffset;
-    cmd->vertex_argbuf_stride = VBStride;
+    if (sig->UpdateVertexBuffers && VBStride) {
+      cmd->vertex_base = cmd->vertex_buffer;
+      auto [tables, at] = allocator_->AllocateGPUHeap(VBStride * MaxCommandCount, 16);
+      cmd->vertex_buffer = allocator_->gpu_heap_buffer_address_ + at;
+      cmd->vertex_argbuf_stride = VBStride;
+    }
     ResetIndirectState(sig, false);
     if (!cmd->draws)
       return;
@@ -4242,16 +4501,18 @@ public:
     auto rootargs = compute ? rootarg_compute_staging_ : rootarg_graphics_staging_;
     for (auto [offset, count] : sig->ResetRootDwords)
       std::fill_n(reinterpret_cast<uint32_t *>(rootargs) + offset, count, 0u);
-    if (compute) {
-      dirty_state_.set(DirtyState::ComputeRootArguments);
+    auto dirty = compute ? DirtyState::ComputeRootArguments : DirtyState::GraphicsRootArguments;
+    if (auto rootsig = compute ? rootsig_compute_.ptr() : rootsig_graphics_.ptr())
+      NullRootViews(rootsig, rootargs, dirty);
+    RootArgumentsChanged(dirty);
+    if (compute)
       return;
-    }
     for (unsigned slot = 0; slot < vertex_buffers_.size(); slot++)
       if (sig->ResetVertexBuffers & (1u << slot))
         vertex_buffers_[slot] = {};
     if (sig->UpdateIndexBuffer)
       IASetIndexBuffer(nullptr);
-    dirty_state_.set(DirtyState::GraphicsRootArguments, DirtyState::VertexBuffer);
+    dirty_state_.set(DirtyState::VertexBuffer);
   }
 
   void STDMETHODCALLTYPE
@@ -4380,6 +4641,22 @@ public:
       ID3D12Resource *pDstResource, UINT DstSubresource, UINT DstX, UINT DstY, ID3D12Resource *pSrcResource,
       UINT SrcSubresource, D3D12_RECT *pSrcRect, DXGI_FORMAT Format, D3D12_RESOLVE_MODE ResolveMode
   ) {
+    // a source with one sample has nothing to resolve: its texels are the result, so it is a copy of the rectangle
+    // (Metal resolves only multisampled attachments). CopyTextureRegion opens the predication of its own
+    if (ResolveMode != D3D12_RESOLVE_MODE_ENCODE_SAMPLER_FEEDBACK &&
+        ResolveMode != D3D12_RESOLVE_MODE_DECODE_SAMPLER_FEEDBACK && pDstResource && pSrcResource && pDstResource != pSrcResource) {
+      auto *single = static_cast<MTLD3D12Resource *>(pSrcResource);
+      if (single->texture && single->texture->sampleCount() <= 1 &&
+          static_cast<MTLD3D12Resource *>(pDstResource)->texture) {
+        D3D12_TEXTURE_COPY_LOCATION to{pDstResource, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = DstSubresource}};
+        D3D12_TEXTURE_COPY_LOCATION from{pSrcResource, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {.SubresourceIndex = SrcSubresource}};
+        D3D12_BOX box{};
+        if (pSrcRect)
+          box = {(UINT)pSrcRect->left, (UINT)pSrcRect->top, 0, (UINT)pSrcRect->right, (UINT)pSrcRect->bottom, 1};
+        CopyTextureRegion(&to, DstX, DstY, 0, &from, pSrcRect ? &box : nullptr);
+        return;
+      }
+    }
     PredicatedPasses predicated(this);
     if (ResolveMode == D3D12_RESOLVE_MODE_ENCODE_SAMPLER_FEEDBACK ||
         ResolveMode == D3D12_RESOLVE_MODE_DECODE_SAMPLER_FEEDBACK) {
@@ -4494,7 +4771,10 @@ public:
     for (UINT i = 0; i < Count; i++) {
       auto &param = pParams[i];
       if (pModes && pModes[i] != D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT) {
-        markers_.push_back({param.Dest, param.Value});
+        // a marker says how far the GPU got, to an application that reads it after a device removal and at no other
+        // time (d3d12.immediateMarkers)
+        if (device_->immediate_markers)
+          markers_.push_back({param.Dest, param.Value});
         continue;
       }
       WriteMarkers();
@@ -4641,10 +4921,56 @@ public:
     ERR("ExecuteMetaCommand: meta commands are not supported");
   }
 
+  // a build or a copy of an acceleration structure has a pass of its own, which the queue runs after the one before
+  // it: Metal may run the builds of one encoder together, and Direct3D 12's run in their order, over one scratch
+  // buffer if the application likes. what each does before its own command needs no pass of its own, though: for
+  // builds and copies recorded one after another, the writes of headers and the copies of inputs share the blit pass
+  // before the first of them, and the conversions of transforms and instances a compute pass after it, so that N
+  // builds take N + 1 or N + 2 of Metal's encoders and not 2N or 3N. that work reads the application's inputs and
+  // the headers, and writes headers and buffers of the command's own, none of which a build or copy reads or writes,
+  // so it may run before the commands recorded before it. only a conversion of instances reads a header, to find
+  // an instance's structure: once a build of the run has converted instances, which then name the structures their
+  // addresses had when it was recorded, the next command starts a run of its own
+  struct StructureRun {
+    // the last command's pass, which is open, and its number: another recording may have a pass where this one was
+    const EncoderData *pass = nullptr;
+    uint64_t id = 0;
+    BlitEncoderData *blit = nullptr;
+    ComputeEncoderData *compute = nullptr;
+    bool converted = false;
+  } structure_run_;
+
+  bool
+  JoinsStructures() const {
+    auto open = allocator_->encoder_current;
+    return open && open == structure_run_.pass && open->id == structure_run_.id && structure_run_.blit &&
+           !structure_run_.converted;
+  }
+
+  // what a command that joined the run does before its pass goes to the run's blit pass
   void
-  PreAccelerationStructure() {
-    if (allocator_->encoder_current && allocator_->encoder_current->type == EncoderType::AccelerationStructure)
-      return;
+  StructureBlits(bool Joined) {
+    if (Joined)
+      allocator_->encoder_current = structure_run_.blit;
+  }
+
+  // and to its compute pass, made when the first command asks. the run's passes are linked already: neither is
+  // ended again
+  ComputeEncoderData *
+  StructureCompute(bool Joined) {
+    if (!Joined)
+      return StartComputePass();
+    if (!structure_run_.compute) {
+      allocator_->encoder_current = nullptr;
+      structure_run_.compute = StartComputePass();
+      allocator_->InvalidateCurrentPass();
+    }
+    allocator_->encoder_current = structure_run_.compute;
+    return structure_run_.compute;
+  }
+
+  void
+  StartAccelerationStructurePass() {
     allocator_->InvalidateCurrentPass();
     auto pass = allocator_->AllocatePass<AccelerationStructureEncoderData>();
     pass->type = EncoderType::AccelerationStructure;
@@ -4653,6 +4979,34 @@ public:
     pass->cmd_tail = (wmtcmd_base *)&pass->cmd_head;
     pass->filled = nullptr;
     pass->filled_tail = &pass->filled;
+  }
+
+  // the pass of a build or a copy, after the open one for a command that joined the run, which the commands after it
+  // may join. `Blit`: the pass its header went to, if one; `Conversion`: the pass that converts its instances
+  void
+  PreAccelerationStructure(bool Joined, EncoderData *Blit, ComputeEncoderData *Conversion) {
+    if (Joined) {
+      allocator_->encoder_current = const_cast<EncoderData *>(structure_run_.pass);
+      StartAccelerationStructurePass();
+      structure_run_.pass = allocator_->encoder_current;
+      structure_run_.id = structure_run_.pass->id;
+      structure_run_.converted = Conversion;
+      return;
+    }
+    // with nothing done before it, it goes on in the open pass, as it was recorded
+    PreAccelerationStructure();
+    structure_run_ = {allocator_->encoder_current, allocator_->encoder_current->id,
+                      Blit && Blit->type == EncoderType::Blit ? static_cast<BlitEncoderData *>(Blit) : nullptr,
+                      Conversion, bool(Conversion)};
+  }
+
+  // the open pass of acceleration structure commands, or a new one
+  void
+  PreAccelerationStructure() {
+    if (allocator_->encoder_current && allocator_->encoder_current->type == EncoderType::AccelerationStructure)
+      return;
+    structure_run_ = {};
+    StartAccelerationStructurePass();
   }
 
   // the current pass's build or copy fills the structure, with inputs it kept or those of the structure it copies
@@ -4782,6 +5136,8 @@ public:
     }
     if (source)
       allocator_->acceleration_structures_.push_back(source);
+    bool joined = JoinsStructures();
+    StructureBlits(joined);
     // a top-level structure's instance count is a uint32 the build reads
     obj_handle_t count = 0;
     uint64_t count_offset = 0;
@@ -4837,7 +5193,7 @@ public:
       }
       if (allocator_->records_)
         allocator_->RecordGPUHeap(sources, transforms * sizeof(uint64_t), "transform addresses");
-      StartComputePass();
+      StructureCompute(joined);
       auto &pso = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
       pso.type = WMTComputeCommandSetPSO;
       pso.pso = device_->acceleration_structure_transforms;
@@ -4852,6 +5208,7 @@ public:
       auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
       dispatch.type = WMTComputeCommandDispatchThreads;
       dispatch.size = {transforms, 1, 1};
+      StructureBlits(joined);
     }
     uint64_t size = source ? source->size : 0;
     if (!source) {
@@ -4863,9 +5220,12 @@ public:
     // Metal wants a buffer of instances also when the count it reads is zero
     info.instance_buffer = structure->instances ? structure->instances.handle : count;
     auto kept = KeepInputs(inputs);
+    // the pass its header went to, which the instances' conversion follows
+    auto header_pass = allocator_->encoder_current;
+    ComputeEncoderData *conversion_pass = nullptr;
 
     if (structure->instances) {
-      StartComputePass();
+      conversion_pass = StructureCompute(joined);
       auto &pso = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
       pso.type = WMTComputeCommandSetPSO;
       pso.pso = device_->acceleration_structure_instances;
@@ -4893,7 +5253,7 @@ public:
 
     uint64_t scratch_offset = 0;
     auto scratch = device_->LookupBufferByVA(pDesc->ScratchAccelerationStructureData, &scratch_offset);
-    PreAccelerationStructure();
+    PreAccelerationStructure(joined, header_pass, conversion_pass);
     if (allocator_->records_ && top)
       allocator_->RecordGPUHeap(
           ptr_add(allocator_->gpu_heap_, count_offset), sizeof(inputs.NumDescs), "instance count"
@@ -5083,6 +5443,9 @@ public:
       GiveInputs(*source, DestAccelerationStructureData, Mode == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_SERIALIZE);
       return;
     }
+    // a top-level structure's instances are copied after what converted them, which a pass the copy joined may have
+    bool joined = !source->instances && JoinsStructures();
+    StructureBlits(joined);
     // a compacted copy is as small as the GPU has said by now, if it was asked
     auto compacted = compact && source->compacted_size.value ? *source->compacted_size.value : 0;
     auto structure =
@@ -5096,7 +5459,7 @@ public:
       instances.dst_offset = 0;
       instances.copy_length = source->instance_count * kAccelerationStructureInstanceSize;
     }
-    PreAccelerationStructure();
+    PreAccelerationStructure(joined, allocator_->encoder_current, nullptr);
     Fills(structure.get(), nullptr, source.get());
     auto &copy = allocator_->EncodeAccelerationStructureCommand<wmtcmd_accelerationstructure_copy>();
     copy.type = compact ? WMTAccelerationStructureCommandCopyAndCompact : WMTAccelerationStructureCommandCopy;
@@ -5104,8 +5467,12 @@ public:
     copy.dst = structure->structure;
   }
 
+  // SetPipelineState1 and DispatchRays "can be called from graphics or compute command lists and bundles" (DXR spec,
+  // "SetPipelineState1", "DispatchRays"), the calls on acceleration structures "not from bundles"
   void STDMETHODCALLTYPE
   SetPipelineState1(ID3D12StateObject *pStateObject) {
+    if (Bundled() && Record([state = Com<ID3D12StateObject>(pStateObject)](auto *l) { l->SetPipelineState1(state.ptr()); }))
+      return;
     state_object_ = static_cast<MTLD3D12StateObject *>(pStateObject);
   }
 
@@ -5113,6 +5480,11 @@ public:
   // arguments as the global ones (dispatch_rays in mullion_command.metal)
   void STDMETHODCALLTYPE
   DispatchRays(const D3D12_DISPATCH_RAYS_DESC *pDesc) {
+    if (Bundled() && Record([desc = *pDesc](auto *l) { l->DispatchRays(&desc); }))
+      return;
+    // a grid with a dimension of zero has no ray generation shader to run: Metal takes no empty grid
+    if (!pDesc->Width || !pDesc->Height || !pDesc->Depth)
+      return;
     SM50_RAY_DISPATCH dispatch{
         pDesc->RayGenerationShaderRecord.StartAddress,
         pDesc->MissShaderTable.StartAddress,
@@ -5247,7 +5619,17 @@ public:
   Barrier(UINT32 NumBarrierGroups, const D3D12_BARRIER_GROUP *pBarrierGroups) {
     WriteMarkers();
     barrier_serial_++;
-    OrderingPoint();
+    constexpr auto pixels =
+        D3D12_BARRIER_SYNC_PIXEL_SHADING | D3D12_BARRIER_SYNC_DEPTH_STENCIL | D3D12_BARRIER_SYNC_RENDER_TARGET;
+    bool vertices = false;
+    for (auto &group : std::span(pBarrierGroups, NumBarrierGroups))
+      for (UINT32 i = 0; i < group.NumBarriers; i++) {
+        auto after = group.Type == D3D12_BARRIER_TYPE_GLOBAL    ? group.pGlobalBarriers[i].SyncAfter
+                     : group.Type == D3D12_BARRIER_TYPE_TEXTURE ? group.pTextureBarriers[i].SyncAfter
+                                                                : group.pBufferBarriers[i].SyncAfter;
+        vertices |= !after || (after & ~pixels);
+      }
+    OrderingPoint(vertices);
     // an access to or from NO_ACCESS hands memory from one resource to another that aliases it (Enhanced Barriers,
     // Resource Aliasing), after which another may take the addresses. once a reserved buffer exists, an access from
     // NO_ACCESS, which makes a resource the one that uses the memory, is ordered as ResourceBarrier orders an ALIASING
@@ -5411,14 +5793,23 @@ public:
     if (!color || !output || !depth || !motion)
       return E_INVALIDARG;
     auto motion_format = MotionVectorFormat(motion->pixelFormat());
-    if (motion_format == WMTPixelFormatInvalid) {
+    // DLSS reads motion vectors through their format ("DLSS uses formatted reads so should handle most input buffer
+    // formats", DLSS Programming Guide 3.3): those in one MetalFX does not take, which a shader reads as floats, are
+    // read so by the pass below
+    bool formatted = motion_format == WMTPixelFormatInvalid && device_->downscale_motion &&
+                     !IsIntegerFormat(motion->pixelFormat()) && !DepthStencilPlanarFlags(motion->pixelFormat());
+    if (motion_format == WMTPixelFormatInvalid && !formatted) {
       ERR("TemporalUpscale: motion vectors of format ", motion->pixelFormat(), " are not supported");
       return E_INVALIDARG;
     }
     // motion vectors at the output resolution are brought to the input's (DownscaleMotion), as 32-bit floats
     bool display_motion = pDesc->MotionVectorInDisplayRes && device_->downscale_motion &&
                           (motion->width() != color->width() || motion->height() != color->height());
-    auto scaler_motion_format = display_motion ? WMTPixelFormatRG32Float : motion_format;
+    bool motion_pass = display_motion || formatted;
+    auto scaler_motion_format = motion_pass ? WMTPixelFormatRG32Float : motion_format;
+    // the pass writes the input resolution's motion vectors, or as many as it reads where they are at it already
+    uint32_t pass_width = !motion_pass ? 0 : display_motion ? color->width() : motion->width(),
+             pass_height = !motion_pass ? 0 : display_motion ? color->height() : motion->height();
     auto depth_format = ScalarFloatFormat(depth->pixelFormat());
     auto cache = static_cast<UpscalerCache *>(*ppCache);
     if (!cache)
@@ -5433,7 +5824,10 @@ public:
                                  uint32_t(depth_format),
                                  uint32_t(scaler_motion_format),
                                  uint32_t(!!pDesc->AutoExposure),
-                                 uint32_t(display_motion)};
+                                 uint32_t(display_motion),
+                                 uint32_t(!!pDesc->MotionVectorJittered),
+                                 pass_width,
+                                 pass_height};
     if (!cache->temporal || cache->key != key) {
       WMTFXTemporalScalerInfo info{};
       info.color_format = color->pixelFormat();
@@ -5448,7 +5842,12 @@ public:
       info.input_content_max_scale = 3.0f;
       info.auto_exposure = pDesc->AutoExposure;
       info.input_content_properties_enabled = true;
-      info.requires_synchronous_initialization = true;
+      // the scaler is returned before MetalFX has compiled its pipelines, and upscales more slowly until it has, to
+      // the same image (MTLFXTemporalScalerDescriptor, requiresSynchronousInitialization): the list is not held
+      // through the compilation each time a game changes its resolution or quality mode
+      info.requires_synchronous_initialization = false;
+      // the pass that brings motion vectors to the input resolution writes them in pixels and leaves their jitter in
+      info.jittered_motion_vectors = pDesc->MotionVectorJittered;
       cache->temporal = new TemporalScaler(device_->GetMTLDevice(), info, device_->UsesMetal4());
       if (!cache->temporal->scaler().handle) {
         cache->temporal = nullptr;
@@ -5457,12 +5856,12 @@ public:
         return E_FAIL;
       }
       cache->motion = {};
-      if (display_motion) {
+      if (motion_pass) {
         WMTTextureInfo motion_info{};
         motion_info.type = WMTTextureType2D;
         motion_info.pixel_format = WMTPixelFormatRG32Float;
-        motion_info.width = info.input_width;
-        motion_info.height = info.input_height;
+        motion_info.width = pass_width;
+        motion_info.height = pass_height;
         motion_info.depth = 1;
         motion_info.array_length = 1;
         motion_info.mipmap_level_count = 1;
@@ -5472,7 +5871,7 @@ public:
         cache->motion = device_->GetMTLDevice().newTexture(motion_info);
         if (!cache->motion) {
           cache->temporal = nullptr;
-          ERR("TemporalUpscale: no texture for motion vectors at ", info.input_width, "x", info.input_height);
+          ERR("TemporalUpscale: no texture for motion vectors at ", pass_width, "x", pass_height);
           return E_FAIL;
         }
       }
@@ -5480,7 +5879,8 @@ public:
       Logger::info(str::format(
           "MetalFX: temporal upscaling ", info.input_width, "x", info.input_height, " to ", info.output_width, "x",
           info.output_height, device_->UsesMetal4() ? " (Metal 4)" : "",
-          display_motion ? ", motion vectors brought from the output resolution" : ""
+          display_motion ? ", motion vectors brought from the output resolution" : "",
+          formatted ? str::format(", motion vectors read from format ", motion->pixelFormat()) : ""
       ));
       // MULLION_LOG_LEVEL=debug: what the game gives the scaler, for an image that comes out wrong
       if (Logger::logLevel() <= LogLevel::Debug)
@@ -5495,7 +5895,8 @@ public:
             ", motion at output resolution ", pDesc->MotionVectorInDisplayRes
         ));
     }
-    if (display_motion)
+    // the pass writes the input resolution's motion vectors, or as many as it reads where they are at it already
+    if (motion_pass)
       DownscaleMotion(
           motion, UpscaleView(motion, motion_format), cache, pDesc->MotionVectorScaleX, pDesc->MotionVectorScaleY
       );
@@ -5504,7 +5905,7 @@ public:
     pass->color = UpscaleView(color);
     pass->output = UpscaleView(output);
     pass->depth = UpscaleView(depth, depth_format);
-    pass->motion = display_motion ? WMT::Texture(cache->motion) : UpscaleView(motion, motion_format);
+    pass->motion = motion_pass ? WMT::Texture(cache->motion) : UpscaleView(motion, motion_format);
     pass->exposure =
         UpscaleView(exposure, exposure ? ScalarFloatFormat(exposure->pixelFormat()) : WMTPixelFormatInvalid);
     pass->props = WMTFXTemporalScalerProps{
@@ -5512,8 +5913,8 @@ public:
         pDesc->InputContentHeight ? pDesc->InputContentHeight : color->height(),
         bool(pDesc->InReset),
         bool(pDesc->DepthReversed),
-        display_motion ? 1.0f : pDesc->MotionVectorScaleX,
-        display_motion ? 1.0f : pDesc->MotionVectorScaleY,
+        motion_pass ? 1.0f : pDesc->MotionVectorScaleX,
+        motion_pass ? 1.0f : pDesc->MotionVectorScaleY,
         pDesc->JitterOffsetX,
         pDesc->JitterOffsetY,
         pDesc->PreExposure,
@@ -5572,7 +5973,8 @@ public:
       info.output_width = output->width();
       info.output_height = output->height();
       info.auto_exposure = pDesc->AutoExposure;
-      info.requires_synchronous_initialization = true;
+      // as the temporal scaler's (TemporalUpscale)
+      info.requires_synchronous_initialization = false;
       cache->denoised = new DenoisedScaler(device_->GetMTLDevice(), info, device_->UsesMetal4());
       if (!cache->denoised->scaler().handle) {
         cache->denoised = nullptr;

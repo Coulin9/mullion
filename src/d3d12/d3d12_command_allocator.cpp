@@ -179,16 +179,17 @@ MTLD3D12CommandAllocatorImpl::~MTLD3D12CommandAllocatorImpl() {
     for (auto &used : icb_)
       device_->indirect_command_buffers.Give(std::move(used));
   }
-  ReleaseRuns();
+  ReleaseRuns(0);
   delete records_;
 }
 
-void
-MTLD3D12CommandAllocatorImpl::Discard(EncoderData *Root) {
+// ends the passes of a list, which hold what they draw with
+static void
+DiscardPasses(MTLD3D12Device *device, EncoderData *Root) {
   for (auto pass = std::exchange(Root->next, nullptr); pass;) {
     auto next = pass->next;
     if (diag::profile)
-      device_->PassName(pass);
+      device->PassName(pass);
     switch (pass->type) {
     case EncoderType::Null:
     case EncoderType::Predicate:
@@ -221,6 +222,66 @@ MTLD3D12CommandAllocatorImpl::Discard(EncoderData *Root) {
     }
     pass = next;
   }
+}
+
+void
+MTLD3D12CommandAllocatorImpl::Discard(EncoderData *Root) {
+  DiscardPasses(device_, Root);
+}
+
+struct MTLD3D12CommandAllocatorImpl::Retired {
+  MTLD3D12Device *device;
+  std::deque<EncoderData> lists;
+  std::vector<RecordingArena::Run> commands, arguments;
+  std::deque<std::vector<char>> spill;
+  std::unique_ptr<GPURecording> records;
+  std::vector<PooledICB> icbs;
+  std::vector<Rc<Buffer>> sparse_clear_texels;
+  std::vector<VisibilityWindow> visibility;
+  std::vector<WMT::Reference<WMT::Buffer>> depth_bounds_samples;
+  std::vector<std::shared_ptr<AccelerationStructure>> acceleration_structures;
+  std::vector<std::shared_ptr<const AccelerationStructureInputs>> acceleration_structure_inputs;
+  std::vector<TempBuffer> temp_buffers;
+
+  ~Retired() {
+    for (auto &list : lists)
+      DiscardPasses(device, &list);
+    for (auto &run : commands)
+      device->recording.commands.Release(run);
+    for (auto &run : arguments)
+      device->recording.arguments.Release(run);
+    for (auto &icb : icbs)
+      device->indirect_command_buffers.Give(std::move(icb));
+  }
+};
+
+void
+MTLD3D12CommandAllocatorImpl::Retire() {
+  auto retired = std::make_shared<Retired>();
+  retired->device = device_;
+  // a deque's elements stay where they are when it is moved: the queues hold the lists' roots
+  retired->lists = std::exchange(encoder_lists_, {});
+  // the runs the lists recorded into; those kept from before them stay the allocator's
+  for (auto [cursor, runs] :
+       {std::pair{&cpu_cursor_, &retired->commands}, std::pair{&gpu_cursor_, &retired->arguments}}) {
+    for (size_t i = 0; i < cursor->taken; i++)
+      runs->push_back(cursor->runs[i].run);
+    cursor->runs.erase(cursor->runs.begin(), cursor->runs.begin() + cursor->taken);
+    cursor->offset = cursor->end = cursor->taken = 0;
+  }
+  retired->spill = std::exchange(spill_, {});
+  retired->records.reset(std::exchange(records_, records_ ? new GPURecording : nullptr));
+  // the indirect command buffers the lists run go to the device's pool after them, not to the next lists
+  for (auto &used : icb_)
+    retired->icbs.push_back(std::move(used));
+  icb_.clear();
+  retired->sparse_clear_texels = std::exchange(sparse_clear_texels_, {});
+  retired->visibility = std::exchange(visibility_, {});
+  retired->depth_bounds_samples = std::exchange(depth_bounds_samples_, {});
+  retired->acceleration_structures = std::exchange(acceleration_structures_, {});
+  retired->acceleration_structure_inputs = std::exchange(acceleration_structure_inputs_, {});
+  retired->temp_buffers = std::exchange(temp_buffers_, {});
+  OutlastCommandQueues(device_, retired);
 }
 
 bool
@@ -285,17 +346,24 @@ MTLD3D12CommandAllocatorImpl::TakeLastArgumentsBuffer() {
 }
 
 void
-MTLD3D12CommandAllocatorImpl::ReleaseRuns() {
+MTLD3D12CommandAllocatorImpl::ReleaseRuns(uint64_t Idle) {
   for (auto &list : encoder_lists_)
     Discard(&list);
   encoder_lists_.clear();
   if (records_)
     records_->Clear();
+  resets_++;
   for (auto [arena, cursor] : {std::pair{&device_->recording.commands, &cpu_cursor_},
                               std::pair{&device_->recording.arguments, &gpu_cursor_}}) {
-    for (auto &run : cursor->runs)
-      arena->Release(run);
-    *cursor = {};
+    for (size_t i = 0; i < cursor->taken; i++)
+      cursor->runs[i].used = resets_;
+    std::erase_if(cursor->runs, [&](auto &kept) {
+      if (resets_ - kept.used < Idle)
+        return false;
+      arena->Release(kept.run);
+      return true;
+    });
+    cursor->offset = cursor->end = cursor->taken = 0;
   }
 }
 
@@ -305,7 +373,7 @@ MTLD3D12CommandAllocatorImpl::MTLD3D12CommandAllocatorImpl(MTLD3D12Device *pDevi
     records_(diag::errors ? new GPURecording : nullptr),
     clear_uav_(device_->GetMTLDevice(), *this),
     transcode_feedback_(*this),
-    clear_rtv_(device_->GetMTLDevice(), *this) {}
+    clear_rtv_(device_->GetLib(), *this) {}
 
 HRESULT
 CreateCommandAllocator(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type, REFIID riid, void **ppCommandAllocator) {
@@ -342,7 +410,7 @@ MTLD3D12CommandAllocatorImpl::Initialize() {
     gpu_heap_buffer_ = last.buffer, gpu_heap_buffer_address_ = last.address, gpu_heap_buffer_length_ = last.length;
   }
   cpu_heap_ = recording.commands.base, gpu_heap_ = recording.arguments.base;
-  ReleaseRuns();
+  ReleaseRuns(kIdleResets);
   exhausted_ = false;
   spill_.clear();
 
@@ -359,7 +427,9 @@ MTLD3D12CommandAllocatorImpl::Initialize() {
     icb_pool_.emplace(used.key, std::move(used));
   icb_.clear();
   sparse_clear_texels_.clear();
-  visibility_.clear();
+  // the lists that counted in the windows have completed (Reset): Metal has stored their counts
+  std::erase_if(visibility_, [](auto &window) { return !window; });
+  visibility_kept_ = std::exchange(visibility_, {});
   visibility_used_ = kVisibilityWindow;
   depth_bounds_samples_.clear();
   depth_bounds_length_ = 0;
@@ -402,10 +472,29 @@ HRESULT STDMETHODCALLTYPE
 MTLD3D12CommandAllocatorImpl::Reset() {
   if (encoder_last)
     return FAIL(E_FAIL);
+  // the passes' compute tessellators ran: the next passes have room for what a slot and a pass made at the most
+  auto grow = [](std::atomic<uint32_t> &most, uint32_t made, const char *what) {
+    for (auto now = most.load(); made > now;)
+      if (most.compare_exchange_weak(now, made)) {
+        Logger::info(str::format("CommandAllocator: a tessellated ", what, " ", made));
+        break;
+      }
+  };
+  for (auto pass : std::exchange(tessellation_passes_, {})) {
+    auto slot = [&](uint64_t need) { return pass->patches ? uint32_t((need + pass->patches - 1) / pass->patches) : 0; };
+    grow(device_->tessellation_slot_points, slot(pass->need_points), "patch has room for points:");
+    grow(device_->tessellation_slot_indices, slot(pass->need_indices), "patch has room for indices:");
+    grow(device_->tessellation_pass_points, pass->need_points, "pass has room for points:");
+    grow(device_->tessellation_pass_indices, pass->need_indices, "pass has room for indices:");
+  }
   // "the runtime will not allow a reset while a command list is still being executed": the lists' recording is what
-  // the GPU still reads
-  if (pending)
+  // the queues' threads still encode and the GPU still reads. Windows' drivers survive the reset and applications
+  // rely on that, so the recording stays for the work the queues have, and the allocator starts again without it:
+  // waiting for that work here could wait for a fence this thread is to signal
+  if (pending) {
     ERR("CommandAllocator: Reset while ", pending.load(), " of its submitted lists have not completed");
+    Retire();
+  }
 
   return Initialize();
 };
@@ -611,6 +700,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
   // the resolver's last thread runs the extras an execution claims, and leaves the counts at zero for the next
   data->extras_claimed = data->extras_done = 0;
   data->draws = 0;
+  data->rootsig_base = data->vertex_base = 0;
   data->so_targets = data->so_scratch_size = data->so_invocations = data->so_lacked = 0;
   if (draws) {
     auto [records, at] = AllocateGPUHeap(MaxCount * sizeof(IndirectMeshDraw), alignof(IndirectMeshDraw));
@@ -860,12 +950,6 @@ MTLD3D12CommandAllocatorImpl::CopyD24(
 }
 
 template <>
-WMT::Library
-SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::getDefaultLibrary() {
-  return ctx.device_->GetLib().getLibrary();
-}
-
-template <>
 void
 SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::startRenderPass() {
   ctx.InvalidateCurrentPass();
@@ -1002,6 +1086,84 @@ SimpleCommandContext<MTLD3D12CommandAllocatorImpl>::draw(
   draw.vertex_count = vertex_count;
   draw.base_instance = base_instance;
   draw.instance_count = instance_count;
+}
+
+// the pass's compute tessellation runs after its draws' hull kernels, before the pass: each patch counted, the counts
+// summed in the patches' order, each frame made. a barrier between each, as each reads what the one before wrote
+void
+MTLD3D12CommandAllocatorImpl::FinishTessellation(RenderEncoderData *Render) {
+  auto batch = std::exchange(Render->tessellation, nullptr);
+  auto [draws, draws_offset] = AllocateGPUHeap(sizeof(TessellationDraw) * batch->draws, 16);
+  auto [counts, counts_offset] = AllocateGPUHeap(sizeof(uint32_t) * 3 * (batch->patches + 1), 16);
+  auto [pass, pass_offset] = AllocateGPUHeap(sizeof(TessellationPass), 16);
+  // the arena (TessellationBatch::Room). a point is {patch, u, v} (tess_point), at a whole point from the heap's start,
+  // as the indices number them
+  uint32_t point_room = batch->Room(batch->slot_points, batch->pass_points, batch->most_points,
+                                    device_->kTessellationMostPoints),
+           index_room = batch->Room(batch->slot_indices, batch->pass_indices, batch->most_indices,
+                                    device_->kTessellationMostIndices);
+  constexpr size_t point = 3 * sizeof(uint32_t);
+  auto points = std::get<1>(AllocateGPUHeap(uint64_t(point_room + 1) * point, 16));
+  points += (point - points % point) % point;
+  auto indices = std::get<1>(AllocateGPUHeap(uint64_t(index_room) * sizeof(uint32_t), 16));
+  auto record = static_cast<TessellationDraw *>(draws);
+  for (auto draw = batch->first; draw; draw = draw->next) {
+    *record++ = draw->record;
+    // the arena is in the buffer the list records into now, which may be longer than the one the draw was recorded
+    // with and then alone covers the arena
+    draw->indexed->index_buffer = gpu_heap_buffer_;
+    draw->indexed->index_buffer_offset = indices;
+    draw->points->buffer = gpu_heap_buffer_;
+  }
+  auto words = [](size_t offset) { return uint32_t(offset / sizeof(uint32_t)); };
+  *static_cast<TessellationPass *>(pass) = {
+      words(draws_offset), batch->draws, batch->patches, words(counts_offset), words(points), words(indices),
+      point_room, index_room, {0, 0, 0}, 0, 0, 0
+  };
+  tessellation_passes_.push_back(static_cast<const TessellationPass *>(pass));
+
+  // the arguments have a longer buffer since the pass's first tessellated draw (GrowArguments): its hull kernels
+  // wrote through one buffer what these kernels read through another, and these write through theirs what the
+  // pass's draws read through the ones they were recorded with. Metal 4 shows what was written through another
+  // buffer over the same memory only after a barrier that asks for it (d3d12_tessellator's largest draws): one
+  // before these kernels, and one before the pass (MTLD3D12CommandQueue)
+  bool aliased = batch->heap != obj_handle_t(gpu_heap_buffer_);
+  Render->order_aliases = aliased;
+  auto barrier = [&](bool aliases = false) {
+    auto &cmd = EncodeBeforeRender<wmtcmd_compute_memory_barrier>();
+    cmd.type = WMTComputeCommandMemoryBarrier;
+    cmd.scope = WMTBarrierScope(WMTBarrierScopeBuffers | (aliases ? WMTBarrierScopeAliases : 0));
+  };
+  auto kernel = [&](const char *name, uint32_t threads) {
+    auto pipeline = device_->GetLib().ComputePipeline(name);
+    auto &set = EncodeBeforeRender<wmtcmd_compute_setpso>();
+    set.type = WMTComputeCommandSetPSO;
+    set.pso = pipeline;
+    set.threadgroup_size = {threads, 1, 1};
+    for (auto [offset, index] : {std::pair{size_t(0), 0}, std::pair{pass_offset, 1}}) {
+      auto &buffer = EncodeBeforeRender<wmtcmd_compute_setbuffer>();
+      buffer.type = WMTComputeCommandSetBuffer;
+      buffer.buffer = gpu_heap_buffer_;
+      buffer.offset = offset;
+      buffer.index = index;
+    }
+  };
+  barrier(aliased);
+  kernel("tessellation_count", kTessellationThreads);
+  auto &count = EncodeBeforeRender<wmtcmd_compute_dispatch>();
+  count.type = WMTComputeCommandDispatchThreads;
+  count.size = {batch->patches, 1, 1};
+  barrier();
+  kernel("tessellation_scan", 1024);
+  auto &scan = EncodeBeforeRender<wmtcmd_compute_dispatch>();
+  scan.type = WMTComputeCommandDispatch;
+  scan.size = {1, 1, 1};
+  barrier();
+  kernel("tessellation_emit", kTessellationThreads);
+  auto &emit = EncodeBeforeRender<wmtcmd_compute_dispatch_indirect>();
+  emit.type = WMTComputeCommandDispatchIndirect;
+  emit.indirect_args_buffer = gpu_heap_buffer_;
+  emit.indirect_args_offset = pass_offset + offsetof(TessellationPass, emit_groups);
 }
 
 }; // namespace mullion

@@ -345,6 +345,7 @@ PipelineRuns(Head head, Name name) {
         break;
       case WMTRenderCommandDrawIndirect:
       case WMTRenderCommandDrawIndexedIndirect:
+      case WMTRenderCommandDrawPatches:
       case WMTRenderCommandDrawMeshThreadgroups:
       case WMTRenderCommandDrawMeshThreadgroupsIndirect:
       case WMTRenderCommandMullionGeometryDraw:

@@ -88,6 +88,11 @@ enum Op : uint32_t {
   IMin = 38,
   UMax = 39,
   UMin = 40,
+  IMul = 41,
+  UMul = 42,
+  UDiv = 43,
+  UAddc = 44,
+  USubb = 45,
   FMad = 46,
   Fma = 47,
   IMad = 48,
@@ -163,6 +168,10 @@ enum Op : uint32_t {
   WavePrefixOp = 121,
   QuadReadLaneAt = 122,
   QuadOp = 123,
+  BitcastI16toF16 = 124,
+  BitcastF16toI16 = 125,
+  BitcastI32toF32 = 126,
+  BitcastF32toI32 = 127,
   LegacyF32ToF16 = 130,
   LegacyF16ToF32 = 131,
   WaveAllBitCount = 135,
@@ -213,6 +222,8 @@ enum Op : uint32_t {
   RayQuery_RayFlags = 195,
   RayQuery_CandidateInstanceContributionToHitGroupIndex = 214,
   RayQuery_CommittedInstanceContributionToHitGroupIndex = 215,
+  StartVertexLocation = 256,
+  StartInstanceLocation = 257,
   AllocateRayQuery2 = 258,
   Dot2AddHalf = 162,
   Dot4AddI8Packed = 163,
@@ -221,6 +232,10 @@ enum Op : uint32_t {
   WaveMultiPrefixOp = 166,
   WaveMultiPrefixBitCount = 167,
   AnnotateHandle = 216,
+  SampleCmpLevel = 224,
+  BarrierByMemoryType = 244,
+  SampleCmpGrad = 254,
+  SampleCmpBias = 255,
   Unpack4x8 = 219,
   Pack4x8 = 220,
   IsHelperLane = 221,
@@ -425,7 +440,7 @@ ray_calls(const Function &F) {
         calls |= op == TraceRay ? SM50_RAY_SHADER_CALLS_TRACE : op == CallShader ? SM50_RAY_SHADER_CALLS_CALLABLE : 0;
       } else if (!callee || callee->isDeclaration()) {
         // another library's function, or an indirect call
-        calls |= SM50_RAY_SHADER_CALLS_TRACE | SM50_RAY_SHADER_CALLS_CALLABLE;
+        calls |= SM50_RAY_SHADER_CALLS_TRACE | SM50_RAY_SHADER_CALLS_CALLABLE | SM50_RAY_SHADER_CALLS_LIBRARY;
       } else if (seen.insert(callee).second) {
         next.push_back(callee);
       }
@@ -882,7 +897,8 @@ if (auto resources = M.getNamedMetadata("dx.resources")) {
         // a resource consumed together with a sampler is sampled, or compared by a comparing operation, as DXBC's
         // sample_c marks it
         auto how = opcode(consumer);
-        bool compared = how == SampleCmp || how == SampleCmpLevelZero || how == TextureGatherCmp;
+        bool compared = how == SampleCmp || how == SampleCmpLevelZero || how == TextureGatherCmp ||
+                        how == SampleCmpLevel || how == SampleCmpGrad || how == SampleCmpBias;
         bool sampled = llvm::any_of(consumer->args(), [&](auto &arg) { return handle_of(arg, SamplerClass); });
         // feedback is written with atomics, which read
         // and an acceleration structure is read by the query or the ray it starts
@@ -1014,6 +1030,16 @@ read_dxil(
   if (!module)
     return module.takeError();
   auto &M = **module;
+  // the device has no DoublePrecisionFloatShaderOps, as for a DXBC shader's double instructions, and Metal has no
+  // 64-bit float to compute them in: a shader that has a double value anywhere is refused here, by name, where
+  // Metal's compiler would refuse what it was converted to without one
+  auto is_double = [](const Value *v) { return v->getType()->getScalarType()->isDoubleTy(); };
+  for (auto &F : M)
+    for (auto &I : instructions(F))
+      if (is_double(&I) || any_of(I.operands(), [&](const Use &use) { return is_double(use.get()); }))
+        return make_error<UnsupportedFeature>(
+            std::format("unsupported: a double-precision operation ({}) in {}", I.getOpcodeName(), F.getName().str())
+        );
   auto entry = read_entry(M);
 
   read_resources(M, info);
@@ -1333,8 +1359,8 @@ read_dxil(
   auto &n = shader->threadgroup_size;
   info.quads_2d = compute && n[0] % 2 == 0 && n[1] % 2 == 0 &&
                   used(
-                      {DerivCoarseX, DerivCoarseY, DerivFineX, DerivFineY, Sample, SampleBias, SampleCmp, CalculateLOD,
-                       QuadOp, QuadReadLaneAt, QuadVote}
+                      {DerivCoarseX, DerivCoarseY, DerivFineX, DerivFineY, Sample, SampleBias, SampleCmp, SampleCmpBias,
+                       CalculateLOD, QuadOp, QuadReadLaneAt, QuadVote}
                   );
   if (info.quads_2d)
     for (auto type :
@@ -1508,6 +1534,56 @@ convert_dxil(
       auto result = ir.CreateSelect(zero, Constant::getAllOnesValue(type), &I);
       I.replaceUsesWithIf(result, [&](Use &use) { return use.getUser() != result; });
     }
+  // DXC marks every operation that is not precise as fast, which LLVM reads as all seven flags, nnan and ninf among
+  // them: the passes here and Metal's compiler then fold what tells a NaN or an infinity apart (x != x, a - a,
+  // a * 0), and D3D's shaders compute with both (D3D11.3 3.1.1, 3.1.2: NaN and infinity propagate). so a comparison
+  // carries no flag, and no other operation assumes its operands or result are neither. a stage before the
+  // rasterizer also keeps each operation as written, as a DXBC shader's do (Converter::UseFastMath): two shaders
+  // that compute a position with the same expression then give the same depth, whatever else each one does
+  if (start) {
+    bool as_written = ctx.shader_type != D3D10_SB_PIXEL_SHADER && ctx.shader_type != D3D11_SB_COMPUTE_SHADER &&
+                      ctx.shader_type != kShaderLibrary;
+    for (auto &I : instructions(*start)) {
+      if (!isa<FPMathOperator>(&I))
+        continue;
+      if (isa<FCmpInst>(&I)) {
+        I.setFast(false);
+        continue;
+      }
+      I.setHasNoNaNs(false);
+      I.setHasNoInfs(false);
+      if (as_written) {
+        I.setHasAllowContract(false);
+        I.setHasAllowReassoc(false);
+        I.setHasAllowReciprocal(false);
+      }
+    }
+  }
+  // DXIL converts a float to an integer with LLVM's fptosi and fptoui, whose result for a NaN or a value outside the
+  // integer's range LLVM leaves undefined: its passes fold such a conversion of a constant to no value at all. D3D
+  // defines both (D3D11.3 22.13.3 ftoi, 22.13.4 ftou: clamped to the range, and 0 for a NaN), a DXBC shader gets
+  // them here, and a DXBC shader converted to DXIL has these same instructions for its ftoi and ftou. so each
+  // becomes the conversion that gives D3D's result; one of a double stays, which no Metal conversion takes
+  if (start) {
+    IRBuilder<> ir(ctx.llvm);
+    raw_null_ostream nulldbg;
+    llvm::air::AIRBuilder air(ir, nulldbg);
+    for (auto &I : make_early_inc_range(instructions(*start))) {
+      auto op = I.getOpcode();
+      if (op != llvm::Instruction::FPToSI && op != llvm::Instruction::FPToUI)
+        continue;
+      auto from = I.getOperand(0)->getType()->getScalarType();
+      auto bits = I.getType()->getScalarSizeInBits();
+      if ((!from->isFloatTy() && !from->isHalfTy()) || (bits != 16 && bits != 32 && bits != 64))
+        continue;
+      ir.SetInsertPoint(&I);
+      I.replaceAllUsesWith(air.CreateConvertToInteger(
+          I.getOperand(0),
+          op == llvm::Instruction::FPToSI ? llvm::air::Signedness::Signed : llvm::air::Signedness::Unsigned, bits
+      ));
+      I.eraseFromParent();
+    }
+  }
   // one Metal function can run several DXIL functions (a hull shader's phases, the stages tessellation fuses), each
   // linked in on its own: only this one keeps its body, under a name no other takes, and module variables stay private
   // to it
@@ -2062,15 +2138,17 @@ convert_dxil(
     );
     return ir.CreateGEP(ty, file.ptr_int4, index);
   };
-  auto sample = [&](CallInst *call, Handle &tex, Handle &smp, unsigned coord_first) {
+  // `slots`: the call's coordinate operands from `coord_first`, four for samples, gathers and feedback writes, three for
+  // CalculateLOD, whose next operand is its clamped flag (DXIL.rst); an array index follows the logical coordinates
+  auto sample = [&](CallInst *call, Handle &tex, Handle &smp, unsigned coord_first, unsigned slots = 4) {
     auto &info = llvm::air::AIRBuilder::getTextureInfo(tex.texture->Logical);
     auto logical = count(air.getTextureSampleCoordType(Texture{.kind = tex.texture->Logical}));
     auto ty = air.getTextureSampleCoordType(tex.texture->Texture);
-    auto array = arg(call, coord_first + logical);
+    auto array = logical < slots ? arg(call, coord_first + logical) : nullptr;
     return std::tuple{
         tex.texture->Texture,
         vec(call, coord_first, logical, ty),
-        defined(array) ? dxbc.ClampArrayIndex(array, tex.texture->Metadata) : nullptr,
+        array && defined(array) ? dxbc.ClampArrayIndex(array, tex.texture->Metadata) : nullptr,
         info.is_cube ? smp.sampler->CubeSamplerHandle : smp.sampler->SamplerHandle,
         dxbc.DecodeSamplerBias(smp.sampler->Metadata),
         logical,
@@ -2215,12 +2293,17 @@ convert_dxil(
       types.push_back(a->getType());
     return ir.CreateCall(ctx.module.getOrInsertFunction(fn, FunctionType::get(ret, types, false), convergent), args);
   };
+  // the lanes whose condition holds; a ballot's name has no sign, as Apple's compiler writes it, and Apple's verifier
+  // refuses air.simd_ballot.u.i64
+  auto lanes_where = [&](Value *condition) {
+    return simd("simd_ballot", ir.getInt64Ty(), {condition}, ir.getInt64Ty(), Signedness::DontCare);
+  };
   // "The bits corresponding to inactive or helper lanes will be zero" (DXC Wave Intrinsics); not every GPU's ballot
   // leaves helpers out
   auto ballot = [&](Value *condition) {
     if (ctx.shader_type == D3D10_SB_PIXEL_SHADER)
       condition = ir.CreateAnd(condition, ir.CreateNot(simd("simd_is_helper_thread", ir.getInt1Ty(), {})));
-    return simd("simd_ballot", ir.getInt64Ty(), {condition}, ir.getInt64Ty());
+    return lanes_where(condition);
   };
   auto i16 = [&](Value *v) { return ir.CreateTrunc(v, ir.getInt16Ty()); };
   // a function that moves `v` between lanes (shuffle, broadcast): bools travel as 32 bits, 64-bit values as halves
@@ -2804,8 +2887,8 @@ convert_dxil(
             "air.ctz.i64", FunctionType::get(ir.getInt64Ty(), {ir.getInt64Ty(), ir.getInt1Ty()}, false)
         );
         auto helper = simd("simd_is_helper_thread", ir.getInt1Ty(), {});
-        auto real = simd("simd_ballot", ir.getInt64Ty(), {ir.CreateNot(helper)}, ir.getInt64Ty());
-        auto active = simd("simd_ballot", ir.getInt64Ty(), {ir.getTrue()}, ir.getInt64Ty());
+        auto real = lanes_where(ir.CreateNot(helper));
+        auto active = lanes_where(ir.getTrue());
         auto lanes = ir.CreateSelect(ir.CreateICmpNE(real, ir.getInt64(0)), real, active);
         ret = move("simd_shuffle", a(1), {i16(ir.CreateCall(ctz, {lanes, ir.getFalse()}))});
       } else
@@ -3140,14 +3223,22 @@ convert_dxil(
     case SampleLevel:
     case SampleGrad:
     case SampleCmp:
-    case SampleCmpLevelZero: {
+    case SampleCmpLevelZero:
+    case SampleCmpLevel:
+    case SampleCmpBias:
+    case SampleCmpGrad: {
       auto &tex = handles[a(1)];
       auto &smp = handles[a(2)];
       auto [texture, coord, array, sampler, bias, logical, coord_ty] = sample(call, tex, smp, 3);
       int32_t offset[3];
       offsets(call, 7, 3, offset);
       auto handle = tex.texture->Handle;
-      auto reference = op == SampleCmp || op == SampleCmpLevelZero ? dxbc.CompareReference(smp.sampler->Metadata, a(10)) : nullptr;
+      // SampleCmp with the level SampleLevel takes (SM 6.7), or the bias or gradients SampleBias and SampleGrad take
+      // (SM 6.8): each comparison's operands are its plain sample's after the reference
+      bool compares = op != Sample && op != SampleBias && op != SampleLevel && op != SampleGrad;
+      auto reference = compares ? dxbc.CompareReference(smp.sampler->Metadata, a(10)) : nullptr;
+      if (op == SampleCmpBias)
+        bias = ir.CreateFAdd(a(11), bias);
       // compute shaders have no derivatives: they sample with their quads' gradients, or compare at their LOD
       bool compute = ctx.shader_type == D3D11_SB_COMPUTE_SHADER;
       Value *residency_level = nullptr, *residency_bias = bias, *residency_clamp = nullptr;
@@ -3166,10 +3257,11 @@ convert_dxil(
         read = [&, gx, gy, clamp](Value *s, Value *) {
           return air.CreateSampleGrad(texture, handle, s, coord, array, gx, gy, clamp, offset);
         };
-      } else if (compute && op == SampleCmp) {
+      } else if (compute && (op == SampleCmp || op == SampleCmpBias)) {
         auto is_cube = llvm::air::AIRBuilder::getTextureInfo(tex.texture->Logical).is_cube;
         auto lod = llvm::air::sample_level{air.CreateFPBinOp(
-            llvm::air::AIRBuilder::fmax, min_lod(tex, a(11)), ir.CreateFAdd(quad_lod(*tex.texture, coord, is_cube), bias)
+            llvm::air::AIRBuilder::fmax, min_lod(tex, a(op == SampleCmp ? 11 : 12)),
+            ir.CreateFAdd(quad_lod(*tex.texture, coord, is_cube), bias)
         )};
         residency_level = lod.lod;
         read = [&, lod](Value *s, Value *ref) {
@@ -3213,19 +3305,25 @@ convert_dxil(
           };
           break;
         }
-        case SampleGrad: {
-          auto dx = vec(call, 10, logical, coord_ty), dy = vec(call, 13, logical, coord_ty);
+        case SampleGrad:
+        case SampleCmpGrad: {
+          unsigned first = op == SampleGrad ? 10 : 11;
+          auto dx = vec(call, first, logical, coord_ty), dy = vec(call, first + 3, logical, coord_ty);
           auto gx = dxbc.BiasGradient(dx, bias), gy = dxbc.BiasGradient(dy, bias);
-          auto clamp = min_lod(tex, a(16));
+          auto clamp = min_lod(tex, a(first + 6));
           residency_dx = gx, residency_dy = gy, residency_clamp = clamp, residency_bias = nullptr;
-          footprint = {.DDX = dx, .DDY = dy, .Bias = bias, .MinLOD = clamp};
-          read = [&, gx, gy, clamp](Value *s, Value *) {
-            return air.CreateSampleGrad(texture, handle, s, coord, array, gx, gy, clamp, offset);
+          if (op == SampleGrad)
+            footprint = {.DDX = dx, .DDY = dy, .Bias = bias, .MinLOD = clamp};
+          read = [&, gx, gy, clamp](Value *s, Value *ref) {
+            return air.CreateSampleGrad(texture, handle, s, coord, array, gx, gy, clamp, offset, ref);
           };
           break;
         }
-        case SampleCmp: {
-          auto options = std::pair{llvm::air::sample_bias{bias}, llvm::air::sample_min_lod_clamp{min_lod(tex, a(11))}};
+        case SampleCmp:
+        case SampleCmpBias: {
+          auto options = std::pair{
+              llvm::air::sample_bias{bias}, llvm::air::sample_min_lod_clamp{min_lod(tex, a(op == SampleCmp ? 11 : 12))}
+          };
           residency_bias = options.first.bias, residency_clamp = options.second.lod;
           read = [&, options](Value *s, Value *ref) {
             return dxbc.SampleImplicit(
@@ -3236,7 +3334,7 @@ convert_dxil(
           break;
         }
         default: {
-          auto lod = llvm::air::sample_level{min_lod(tex, bias)};
+          auto lod = llvm::air::sample_level{min_lod(tex, op == SampleCmpLevel ? ir.CreateFAdd(a(11), bias) : bias)};
           residency_level = lod.lod;
           read = [&, lod](Value *s, Value *ref) {
             return ref ? air.CreateSampleCmp(texture, handle, s, coord, array, ref, offset, lod)
@@ -3256,7 +3354,7 @@ convert_dxil(
             *tex.texture, sampler, smp.sampler->Metadata, coord, array, offset, {value, residency},
             [&](Value *s) { return read(s, reference); }, residency_level, residency_bias, residency_clamp,
             residency_dx, residency_dy);
-      if (op == SampleCmpLevelZero)
+      if (op == SampleCmpLevelZero || op == SampleCmpLevel)
         value = dxbc.ComparePointAtZero(*tex.texture, smp.sampler->Metadata, reference, value, [&] {
           return read(sampler, nullptr).first;
         });
@@ -3416,7 +3514,7 @@ convert_dxil(
     }
     case CalculateLOD: {
       auto &tex = handles[a(1)];
-      auto [texture, coord, array, sampler, bias, logical, coord_ty] = sample(call, tex, handles[a(2)], 3);
+      auto [texture, coord, array, sampler, bias, logical, coord_ty] = sample(call, tex, handles[a(2)], 3, 3);
       auto is_cube = llvm::air::AIRBuilder::getTextureInfo(tex.texture->Logical).is_cube;
       auto [clamped, unclamped] = dxbc.CalculateLOD(
           *tex.texture, sampler, handles[a(2)].sampler->Metadata, coord,
@@ -3619,7 +3717,7 @@ convert_dxil(
         ir.SetInsertPoint(loop);
         auto pending = ir.CreatePHI(ir.getInt1Ty(), 2);
         pending->addIncoming(first, head);
-        auto lanes = simd("simd_ballot", ir.getInt64Ty(), {pending}, ir.getInt64Ty());
+        auto lanes = lanes_where(pending);
         ir.CreateCondBr(ir.CreateICmpNE(lanes, ir.getInt64(0)), turn, rest);
         ir.SetInsertPoint(turn);
         auto leader = ir.CreateTrunc(ir.CreateCall(ctz, {lanes, ir.getFalse()}), ir.getInt32Ty());
@@ -3950,8 +4048,30 @@ convert_dxil(
     case LegacyF16ToF32:
       ret = air.CreateConvertToFloat(ir.CreateBitCast(ir.CreateTrunc(a(1), ir.getInt16Ty()), ir.getHalfTy()));
       break;
-    case Barrier: {
+    case Barrier:
+    case BarrierByMemoryType: {
+      // DxilConstants.h BarrierMode: SyncThreadGroup 1, UAVFenceGlobal 2, UAVFenceThreadGroup 4, TGSMFence 8
       auto mode = constant(a(1));
+      if (op == BarrierByMemoryType) {
+        // SM 6.8's Barrier(MemoryTypeFlags, SemanticFlags) names the memory and the scope apart (DirectX-Specs,
+        // Work Graphs, "Barrier"): UAV_MEMORY 1 and GROUP_SHARED_MEMORY 2 are a compute shader's, in GROUP_SCOPE 2 or
+        // DEVICE_SCOPE 4, with GROUP_SYNC 1; ALL_MEMORY is every kind the shader has. a node's records
+        // (NODE_INPUT_MEMORY 4, NODE_OUTPUT_MEMORY 8) and a scope past those are of shaders that are not lowered
+        constexpr uint32_t uav = 1, group_shared = 2, all_memory = 0xf, group_sync = 1, group_scope = 2,
+                           device_scope = 4;
+        auto memory = constant(a(1)), semantic = constant(a(2));
+        if (memory == all_memory)
+          memory = uav | group_shared;
+        if ((memory & ~(uav | group_shared)) || (semantic & ~(group_sync | group_scope | device_scope)))
+          return make_error<UnsupportedFeature>(
+              std::format("a barrier of memory {:#x} with semantics {:#x} is not lowered yet", memory, semantic)
+          );
+        mode = (semantic & group_sync ? 1 : 0) | (memory & group_shared ? 8 : 0) |
+               (memory & uav ? (semantic & device_scope  ? 2
+                                : semantic & group_scope ? 4
+                                                         : 0)
+                             : 0);
+      }
       dxbc(
           InstSync{
               .uav_boundary = mode & 2   ? InstSync::UAVBoundary::global
@@ -4033,21 +4153,15 @@ convert_dxil(
       ret = fp_unary(llvm::air::AIRBuilder::trunc, a(1));
       break;
     case IsNaN:
-      ret = air.CreateIsNaN(a(1));
-      break;
     case IsInf:
-      ret = ir.CreateFCmpOEQ(fp_unary(llvm::air::AIRBuilder::fabs, a(1)), ConstantFP::getInfinity(a(1)->getType()));
-      break;
     case IsFinite:
-      ret = ir.CreateFCmpOLT(fp_unary(llvm::air::AIRBuilder::fabs, a(1)), ConstantFP::getInfinity(a(1)->getType()));
-      break;
     case IsNormal: {
-      auto magnitude = fp_unary(llvm::air::AIRBuilder::fabs, a(1));
-      auto &semantics = a(1)->getType()->getFltSemantics();
-      ret = ir.CreateAnd(
-          ir.CreateFCmpOGE(magnitude, ConstantFP::get(a(1)->getType(), APFloat::getSmallestNormalized(semantics))),
-          ir.CreateFCmpOLT(magnitude, ConstantFP::getInfinity(a(1)->getType()))
-      );
+      using llvm::air::AIRBuilder;
+      const AIRBuilder::FPClass classes[] = {
+          AIRBuilder::FPClass::nan, AIRBuilder::FPClass::infinite, AIRBuilder::FPClass::finite,
+          AIRBuilder::FPClass::normal
+      };
+      ret = air.CreateIsFPClass(classes[op - IsNaN], a(1));
       break;
     }
     case Bfrev:
@@ -4080,6 +4194,43 @@ convert_dxil(
       ret = op == FMad && (precise || call->getMetadata("dx.precise")) ? ir.CreateFAdd(ir.CreateFMul(a(1), a(2)), a(3))
                                                                    : air.CreateFMA(a(1), a(2), a(3));
       break;
+    // the operations with two results that DXBC's imul, umul, udiv, uaddc and usubb become when a DXBC shader is
+    // converted to DXIL, and the bit casts its untyped registers need; DXIL.rst gives each under its name
+    case IMul:
+    case UMul: {
+      // "producing the correct full 64-bit result": the high half, then the low
+      auto half = cast<StructType>(ty)->getElementType(0);
+      auto bits = half->getIntegerBitWidth();
+      auto wide = IntegerType::get(ctx.llvm, 2 * bits);
+      auto extend = [&](Value *v) { return op == IMul ? ir.CreateSExt(v, wide) : ir.CreateZExt(v, wide); };
+      auto product = ir.CreateMul(extend(a(1)), extend(a(2)));
+      ret = ir.CreateInsertValue(UndefValue::get(ty), ir.CreateTrunc(ir.CreateLShr(product, bits), half), {0});
+      ret = ir.CreateInsertValue(ret, ir.CreateTrunc(product, half), {1});
+      break;
+    }
+    case UDiv: {
+      // the quotient, then the remainder: "Divide by zero returns 0xffffffff for both"
+      auto zero = ir.CreateICmpEQ(a(2), Constant::getNullValue(a(2)->getType()));
+      auto divisor = ir.CreateSelect(zero, ConstantInt::get(a(2)->getType(), 1), a(2));
+      auto ones = Constant::getAllOnesValue(a(1)->getType());
+      ret = ir.CreateInsertValue(UndefValue::get(ty), ir.CreateSelect(zero, ones, ir.CreateUDiv(a(1), divisor)), {0});
+      ret = ir.CreateInsertValue(ret, ir.CreateSelect(zero, ones, ir.CreateURem(a(1), divisor)), {1});
+      break;
+    }
+    case UAddc:
+    case USubb: {
+      // the low bits of the sum or difference, then whether it carried or borrowed
+      auto result = op == UAddc ? ir.CreateAdd(a(1), a(2)) : ir.CreateSub(a(1), a(2));
+      ret = ir.CreateInsertValue(UndefValue::get(ty), result, {0});
+      ret = ir.CreateInsertValue(ret, op == UAddc ? ir.CreateICmpULT(result, a(1)) : ir.CreateICmpULT(a(1), a(2)), {1});
+      break;
+    }
+    case BitcastI16toF16:
+    case BitcastF16toI16:
+    case BitcastI32toF32:
+    case BitcastF32toI32:
+      ret = ir.CreateBitCast(a(1), ty);
+      break;
     case IMad:
     case UMad:
       ret = ir.CreateAdd(ir.CreateMul(a(1), a(2)), a(3));
@@ -4099,16 +4250,27 @@ convert_dxil(
     }
     case Dot4AddI8Packed:
     case Dot4AddU8Packed: {
-      auto bytes = [&](Value *v) {
-        auto b = ir.CreateBitCast(v, FixedVectorType::get(ir.getInt8Ty(), 4));
-        auto wide = FixedVectorType::get(ir.getInt32Ty(), 4);
-        return op == Dot4AddI8Packed ? ir.CreateSExt(b, wide) : ir.CreateZExt(b, wide);
+      // bytes 0 and 2, then 1 and 3, as the halves of one word of two 16-bit values: Apple GPUs multiply those at
+      // about twice the rate of bytes widened to 32 bits one by one. a signed byte is (u ^ 0x80) - 0x80 in its half
+      bool is_signed = op == Dot4AddI8Packed;
+      auto halves = [&](Value *v, unsigned shift) {
+        Value *w = ir.CreateAnd(ir.CreateLShr(v, shift), 0x00ff00ff);
+        auto h = ir.CreateBitCast(is_signed ? ir.CreateXor(w, 0x00800080) : w, FixedVectorType::get(ir.getInt16Ty(), 2));
+        return is_signed ? ir.CreateSub(h, ConstantInt::get(h->getType(), 0x80)) : h;
       };
-      // summed lane by lane: Metal's compiler service crashes on llvm.vector.reduce.add
-      auto products = ir.CreateMul(bytes(a(2)), bytes(a(3)));
+      // summed lane by lane: Metal's compiler service crashes on llvm.vector.reduce.add. the sum wraps; a product of
+      // two bytes fits 16 bits
       ret = a(1);
-      for (unsigned i = 0; i < 4; i++)
-        ret = ir.CreateAdd(ret, ir.CreateExtractElement(products, i));
+      for (unsigned shift : {0u, 8u}) {
+        auto x = halves(a(2), shift), y = halves(a(3), shift);
+        for (unsigned i = 0; i < 2; i++) {
+          auto wide = [&](Value *h) {
+            auto e = ir.CreateExtractElement(h, i);
+            return is_signed ? ir.CreateSExt(e, ir.getInt32Ty()) : ir.CreateZExt(e, ir.getInt32Ty());
+          };
+          ret = ir.CreateAdd(ret, ir.CreateMul(wide(x), wide(y), "", !is_signed, true));
+        }
+      }
       break;
     }
     case Pack4x8: {
@@ -4163,6 +4325,19 @@ convert_dxil(
       // pipelines have one view: view instancing is unsupported
       ret = ir.getInt32(0);
       break;
+    case StartVertexLocation:
+    case StartInstanceLocation: {
+      // SM 6.8, "Extended Command Information": SV_StartVertexLocation is DrawInstanced's StartVertexLocation or
+      // DrawIndexedInstanced's BaseVertexLocation, and SV_StartInstanceLocation the StartInstanceLocation of either:
+      // what the draw adds to SV_VertexID and SV_InstanceID, which start at zero, to find a vertex's data
+      // https://microsoft.github.io/hlsl-specs/proposals/0015-extended-command-info/
+      ret = op == StartVertexLocation ? ctx.resource.base_vertex_id : ctx.resource.base_instance_id;
+      if (!ret)
+        return make_error<UnsupportedFeature>(
+            "a draw's start locations are read in a stage that is not a vertex shader"
+        );
+      break;
+    }
     case IsHelperLane:
       ret =
           ctx.shader_type == D3D10_SB_PIXEL_SHADER ? simd("simd_is_helper_thread", ir.getInt1Ty(), {}) : ir.getFalse();
@@ -4735,7 +4910,6 @@ convert_dxil_mesh_stage(
         conservative ? triangles : pShaderInternal->mesh_max_primitives,
         pShaderInternal->mesh_lines ? air::MeshOutputTopology::Line : air::MeshOutputTopology::Triangle
     });
-    func_signature.UseMaxMeshWorkgroupSize(threads[0] * threads[1] * threads[2]);
     uint32_t clip_distances = 0, cull_distances = 0;
     bool culled = false;
     for (bool primitive : {false, true}) {
@@ -4811,10 +4985,11 @@ convert_dxil_mesh_stage(
       cm.at = cm.registers[0].size();
       define_conservative_varyings(func_signature, cm.at, cm.barycentrics);
     }
-  } else {
+  } else
     func_signature.DefineInput(air::InputMeshGridProperties{});
-    func_signature.UseMaxWorkgroupSize(threads[0] * threads[1] * threads[2]);
-  }
+  // the threads of a threadgroup, which a draw dispatches (mesh_threads, object_threads); air.max_mesh_work_groups is
+  // an object function's grid limit, and Apple's verifier calls a mesh function with it corrupt
+  func_signature.UseMaxWorkgroupSize(threads[0] * threads[1] * threads[2]);
 
   uint32_t viewports_idx = 0;
   if (conservative)
@@ -4841,7 +5016,7 @@ convert_dxil_mesh_stage(
   // a mesh shader without an amplification shader runs DispatchMesh's grid itself, which Metal has smaller than D3D12:
   // a grid past it runs in parts, and the raster scale's buffer tells each part's first group
   bool origin = mesh && link && !link->amplified && !conservative;
-  auto raster_scale = DefineRasterScale(func_signature, origin ? SM50_RASTER_SCALE_WORDS : 1);
+  auto raster_scale = DefineRasterScale(func_signature);
   auto [function, function_metadata] = func_signature.CreateFunction(name, context, module, 0, true);
 
   auto entry_bb = llvm::BasicBlock::Create(context, "entry", function);
@@ -5074,6 +5249,79 @@ convert_dxil_ray_shader(
   module.getOrInsertNamedMetadata("air.visible")
       ->addOperand(md({llvm::ValueAsMetadata::get(function), md({}),
                        md({argument(0, "MullionRayContext"), argument(1, "void"), argument(2, "void")})}));
+  return llvm::Error::success();
+}
+
+// a dispatcher of a ray tracing pipeline (SM50CompileRayDispatcher): a visible function that takes a slot and what a
+// shader takes, and calls the shader of the slot as a Metal function calls an extern [[visible]] one, so that Metal
+// can compile the shader into its caller. the context starts with the pipeline's function table
+llvm::Error
+convert_ray_dispatcher(
+    llvm::LLVMContext &context, llvm::Module &module, SM50_RAY_DISPATCHER dispatcher,
+    llvm::ArrayRef<SM50_RAY_DISPATCHED_SHADER> shaders, bool table, SM50_SHADER_METAL_VERSION metal_version
+) {
+  static const char *const names[SM50_RAY_DISPATCHER_COUNT] = {
+      "mullion_ray_generation_shader", "mullion_ray_closest_shader",  "mullion_ray_any_hit_shader",
+      "mullion_ray_intersection_shader", "mullion_ray_callable_shader",
+  };
+  if (dispatcher >= SM50_RAY_DISPATCHER_COUNT)
+    return llvm::make_error<UnsupportedFeature>("a ray tracing pipeline has no such dispatcher");
+  setup_metal_version(module, metal_version);
+  auto context_ty = ray_context_type(context);
+  llvm::Type *i8p = llvm::Type::getInt8PtrTy(context), *i32 = llvm::Type::getInt32Ty(context);
+  auto void_ty = llvm::Type::getVoidTy(context);
+  auto shader_ty = llvm::FunctionType::get(void_ty, {context_ty->getPointerTo(), i8p, i8p}, false);
+  auto function = llvm::Function::Create(
+      llvm::FunctionType::get(void_ty, {i32, context_ty->getPointerTo(), i8p, i8p}, false),
+      llvm::GlobalValue::ExternalLinkage, names[dispatcher], module
+  );
+  auto md = [&](std::initializer_list<llvm::Metadata *> nodes) { return llvm::MDNode::get(context, nodes); };
+  auto string = [&](llvm::StringRef text) { return llvm::MDString::get(context, text); };
+  llvm::Value *slot = function->getArg(0), *ray_context = function->getArg(1);
+  llvm::IRBuilder<> builder(llvm::BasicBlock::Create(context, "entry", function));
+  auto other = llvm::BasicBlock::Create(context, "other", function);
+  auto cases = builder.CreateSwitch(slot, other);
+  std::set<uint32_t> direct;
+  for (auto &shader : shaders) {
+    llvm::StringRef name(shader.name, strnlen(shader.name, sizeof(shader.name)));
+    if (name.empty() || name.size() == sizeof(shader.name))
+      return llvm::make_error<UnsupportedFeature>("a dispatched ray tracing shader has no name");
+    if (!direct.insert(shader.slot).second)
+      continue;
+    auto symbol = (name + ".MTL_VISIBLE_FN_REF").str();
+    auto callee = module.getFunction(symbol);
+    if (!callee) {
+      callee = llvm::Function::Create(shader_ty, llvm::GlobalValue::ExternalLinkage, symbol, module);
+      callee->setSection("air.externally_defined");
+      module.getOrInsertNamedMetadata("air.visible_function_references")
+          ->addOperand(md({string("air.visible_function_reference"), llvm::ValueAsMetadata::get(callee), string(name)}));
+    }
+    auto block = llvm::BasicBlock::Create(context, "", function, other);
+    cases->addCase(builder.getInt32(shader.slot), block);
+    builder.SetInsertPoint(block);
+    builder.CreateCall(shader_ty, callee, {ray_context, function->getArg(2), function->getArg(3)});
+    builder.CreateRetVoid();
+  }
+  builder.SetInsertPoint(other);
+  if (table) {
+    auto table_ty = context_ty->getElementType(RayShaders);
+    auto lookup = module.getOrInsertFunction(
+        "air.get_function_pointer_visible_function_table", llvm::FunctionType::get(i8p, {table_ty, i32}, false)
+    );
+    auto shaders_table = builder.CreateLoad(table_ty, builder.CreateStructGEP(context_ty, ray_context, RayShaders));
+    auto shader = builder.CreateBitCast(builder.CreateCall(lookup, {shaders_table, slot}), shader_ty->getPointerTo());
+    builder.CreateCall(shader_ty, shader, {ray_context, function->getArg(2), function->getArg(3)});
+  }
+  builder.CreateRetVoid();
+
+  auto argument = [&](unsigned i, const char *type) {
+    return md({llvm::ConstantAsMetadata::get(builder.getInt32(i)), string("air.visible_input"),
+               string("air.arg_type_name"), string(type)});
+  };
+  module.getOrInsertNamedMetadata("air.visible")
+      ->addOperand(md({llvm::ValueAsMetadata::get(function), md({}),
+                       md({argument(0, "uint"), argument(1, "MullionRayContext"), argument(2, "void"),
+                           argument(3, "void")})}));
   return llvm::Error::success();
 }
 

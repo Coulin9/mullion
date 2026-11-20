@@ -125,6 +125,7 @@ struct ShaderVariantPixel {
   uint32_t clip_distances = 0;
   std::array<uint32_t, std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats)> pixel_formats{};
   std::array<SM50_SHADER_BLEND, std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.blend)> blend{};
+  bool no_minmax_filter = false;
   bool operator==(const this_type &rhs) const = default;
 };
 
@@ -136,7 +137,7 @@ struct ShaderVariantTessellationVertexHull {
   uint32_t max_potential_tess_factor;
   uint32_t mesh_vertex_size;
   // the geometry shader that runs after the domain shader, in its mesh stage (null for none), and the most
-  // threadgroups a mesh grid may have (0 while not known)
+  // threadgroups a mesh grid may have (0 when the device tells none)
   ManagedShader geometry_shader_handle;
   uint32_t max_mesh_threadgroups;
   bool operator==(const this_type &rhs) const = default;
@@ -227,7 +228,9 @@ public:
   virtual MTL_SM50_SHADER_ARGUMENT *arguments_info() = 0;
   virtual CompiledShader *get_shader(ShaderVariant variant) = 0;
   CompiledShader *
-  get_pixel_shader(ShaderVariantPixel variant, std::span<const WMTPixelFormat> formats, IMTLD3D11BlendState *blend) {
+  get_pixel_shader(ShaderVariantPixel variant, std::span<const WMTPixelFormat> formats, IMTLD3D11BlendState *blend,
+                   bool minmax_filtering) {
+    variant.no_minmax_filter = !minmax_filtering;
     variant.pixel_formats = PixelShaderOutputFormats(reflection().PixelShader, formats, variant.dual_source_blending);
     WMTRenderPipelineBlendInfo targets{};
     for (unsigned i = 0; i < formats.size(); i++)

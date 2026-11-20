@@ -4,6 +4,7 @@
 #include "log/log.hpp"
 #include "nvapi_lite_common.h"
 #include "util_string.hpp"
+#include "util_env.hpp"
 #include "config/config.hpp"
 #include <algorithm>
 #include "winemetal.h"
@@ -39,8 +40,9 @@ NvAPI_Unload() {
 };
 
 // the driver reported: the display adapter's in Windows' device list (DriverVersion, which a Wine can be set
-// to report; NVIDIA's 617.14 is x.x.16.1714, the last five digits), so NVAPI and the device list agree,
-// else the one this NVAPI's headers come from (NVAPI_SDK_VERSION, 57218 = 572.18). The branch is r617_00. Games and
+// to report; NVIDIA's 617.14 is x.x.16.1714, the last five digits), so NVAPI and the device list agree, else the
+// largest those digits hold, 999.99, as dxvk-nvapi reports for a driver that is not NVIDIA's: games ask for a minimum,
+// and one below it stops at a dialog (Dying Light: The Beast's is 581.08). The branch is r617_00 or r999_00. Games and
 // NVIDIA's libraries check both, and copy the branch as a string, so it ends with its NUL
 static NvU32
 DriverVersion() {
@@ -58,7 +60,7 @@ DriverVersion() {
       if (nvidia >= 30000)
         return nvidia;
     }
-    return NvU32(NVAPI_SDK_VERSION);
+    return NvU32(99999);
   }();
   return version;
 }
@@ -993,15 +995,18 @@ static void *QueryInterfaceImpl(NvU32 id) {
 
 }; // namespace mullion
 
-// NVAPI answers only programs Mullion shows an NVIDIA GPU to (dxgi.customVendorId = 10de): any other, Steam's GPU
-// queries among them, finds no NVAPI, as it would on another vendor's GPU
+// NVAPI answers only programs Mullion shows an NVIDIA GPU to: those DXGI turns NVEXT on for (NvidiaExtensionRequested
+// in dxgi.cpp: MULLION_ENABLE_NVEXT=1, or dxgi.customVendorId = 10de unless MULLION_ENABLE_NVEXT=0). any other,
+// Steam's GPU queries among them, finds no NVAPI, as it would on another vendor's GPU
 extern "C" BOOL WINAPI
 DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
   if (reason != DLL_PROCESS_ATTACH)
     return TRUE;
+  auto env = mullion::env::getEnvVar("MULLION_ENABLE_NVEXT");
   auto vendor = mullion::Config::getInstance().getOption<std::string>("dxgi.customVendorId");
   std::transform(vendor.begin(), vendor.end(), vendor.begin(), [](unsigned char c) { return std::tolower(c); });
-  if (vendor != "10de" && vendor != "0x10de")
+  bool requested = env == "1" || env == "0" ? env == "1" : vendor == "10de" || vendor == "0x10de";
+  if (!requested)
     return FALSE;
   DisableThreadLibraryCalls(instance);
   return TRUE;

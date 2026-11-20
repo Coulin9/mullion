@@ -640,7 +640,8 @@ WINEMETAL_API obj_handle_t NSObject_description(obj_handle_t nserror);
 struct WMTComputePipelineInfo {
   obj_handle_t compute_function;
   struct WMTConstMemoryPointer binary_archives_for_lookup;
-  obj_handle_t binary_archive_for_serialization;
+  // keeps what the pipeline is made of with it, for MTLBinaryArchive_add to add it to an archive later
+  bool keep_for_binary_archive;
   uint16_t num_binary_archives_for_lookup;
   bool fail_on_binary_archive_miss;
   bool support_indirect_command_buffers;
@@ -862,7 +863,8 @@ struct WMTRenderPipelineInfo {
   uint8_t max_tessellation_factor;
   enum WMTWinding tessellation_output_winding_order;
   enum WMTTessellationFactorStepFunction tessellation_factor_step;
-  obj_handle_t binary_archive_for_serialization;
+  // keeps what the pipeline is made of with it, for MTLBinaryArchive_add to add it to an archive later
+  bool keep_for_binary_archive;
   struct WMTConstMemoryPointer binary_archives_for_lookup;
   uint16_t num_binary_archives_for_lookup;
   bool fail_on_binary_archive_miss;
@@ -890,7 +892,8 @@ struct WMTMeshRenderPipelineInfo {
   uint16_t payload_memory_length;
   bool mesh_tgsize_is_multiple_of_sgwidth;
   bool object_tgsize_is_multiple_of_sgwidth;
-  obj_handle_t binary_archive_for_serialization;
+  // keeps what the pipeline is made of with it, for MTLBinaryArchive_add to add it to an archive later
+  bool keep_for_binary_archive;
   struct WMTConstMemoryPointer binary_archives_for_lookup;
   uint16_t num_binary_archives_for_lookup;
   bool fail_on_binary_archive_miss;
@@ -1226,6 +1229,9 @@ enum WMTBarrierScope : uint8_t {
   WMTBarrierScopeBuffers = 1,
   WMTBarrierScopeTextures = 2,
   WMTBarrierScopeRenderTargets = 4,
+  // Metal 4, a compute barrier: also what was written through another buffer over the same memory
+  // (MTL4VisibilityOptionResourceAlias). not a scope of Metal 3's, which is not given it
+  WMTBarrierScopeAliases = 8,
 };
 
 struct wmtcmd_compute_memory_barrier {
@@ -1316,6 +1322,9 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandExecuteCommandsInBufferIndirect,
   WMTRenderCommandSetVertexBytes,
   WMTRenderCommandSetMeshBytes,
+  /* a draw of patches through Metal's tessellator (wmtcmd_render_draw_patches), on Metal 3 encoders only: Metal 4's
+     have no tessellator */
+  WMTRenderCommandDrawPatches,
 };
 
 struct wmtcmd_render_nop {
@@ -1448,6 +1457,18 @@ struct wmtcmd_render_draw {
   uint64_t vertex_count;
   uint32_t instance_count;
   uint32_t base_instance;
+};
+
+struct wmtcmd_render_draw_patches {
+  enum WMTRenderCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t factor_buffer;
+  uint64_t factor_buffer_offset;
+  uint32_t factor_instance_stride;
+  uint32_t control_points;
+  uint32_t patch_count;
+  uint32_t instance_count;
 };
 
 struct wmtcmd_render_draw_indirect {
@@ -1849,6 +1870,10 @@ struct WMTFXTemporalScalerInfo {
   bool auto_exposure;
   bool input_content_properties_enabled;
   bool requires_synchronous_initialization;
+  // the motion vectors hold the jitter of the frames they are between, which MetalFX takes out with the jitter
+  // offsets of each frame (MTLFXTemporalScalerDescriptor.jitteredMotionVectorsEnabled, macOS 27): no scaler is made
+  // where MetalFX lacks it
+  bool jittered_motion_vectors;
 };
 
 struct WMTFXSpatialScalerInfo {
@@ -2209,7 +2234,15 @@ enum WMTMetalVersion : uint32_t {
 
 WINEMETAL_API obj_handle_t MTLDevice_newBinaryArchive(obj_handle_t device, const char *url, obj_handle_t *err_out);
 
-WINEMETAL_API void MTLBinaryArchive_serialize(obj_handle_t archive, const char *url, obj_handle_t *err_out);
+// false when the call did not run to its end: a fault in Metal while it wrote the archive, which Wine returns as the
+// call's status. the archive's queue is then held for good, and no call on the archive returns
+WINEMETAL_API bool MTLBinaryArchive_serialize(obj_handle_t archive, const char *url, obj_handle_t *err_out);
+
+// adds a pipeline made with keep_for_binary_archive to the archive, once: what was kept goes with the add. one add
+// to an archive at a time, and none while it is written: adds of the same function from two threads leave the
+// archive with an entry Metal faults on, then or when it writes the archive (macOS 27.3,
+// -[MTLBinaryEntry internalInitWithData:reflectionBlock:binaryPosition:])
+WINEMETAL_API void MTLBinaryArchive_add(obj_handle_t archive, obj_handle_t pipeline);
 
 WINEMETAL_API obj_handle_t DispatchData_alloc_init(uint64_t native_ptr, uint64_t length);
 
@@ -2222,6 +2255,10 @@ WINEMETAL_API obj_handle_t CacheWriter_alloc_init(const char *path, uint64_t ver
 WINEMETAL_API void CacheWriter_set(obj_handle_t writer, const void *key, uint64_t key_length, obj_handle_t value);
 
 WINEMETAL_API bool WMTSetMetalShaderCachePath(const char *path);
+
+// removes the files in `stem`'s folder whose names start with its last part and not with `kept`'s: what other
+// versions of a store wrote. both are paths as CacheWriter_alloc_init takes them, in one folder
+WINEMETAL_API void WMTRemoveOtherVersions(const char *stem, const char *kept);
 
 WINEMETAL_API obj_handle_t MTLDevice_newSharedTexture(obj_handle_t device, struct WMTTextureInfo *info);
 
@@ -2371,7 +2408,8 @@ struct WMTTileRenderPipelineInfo {
   uint32_t immutable_tile_buffers;
   uint8_t raster_sample_count;
   bool tgsize_matches_tile_size;
-  obj_handle_t binary_archive_for_serialization;
+  // keeps what the pipeline is made of with it, for MTLBinaryArchive_add to add it to an archive later
+  bool keep_for_binary_archive;
   struct WMTConstMemoryPointer binary_archives_for_lookup;
   uint8_t num_binary_archives_for_lookup;
   bool fail_on_binary_archive_miss;
@@ -2624,8 +2662,8 @@ enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixDispatchDataBytes, 
        WMTUnixCommandBufferDenoisedScale, WMTUnixDeviceSupportsFXDenoisedScaler,
        WMTUnixComputeStaticThreadgroupMemory, WMTUnixDeviceMaxThreadgroupMemory,
        WMTUnixDeviceMaxThreadsPerThreadgroup, WMTUnixDeviceReport, WMTUnixTextureSparseTailHolds,
-       WMTUnixDeviceSparseResidencyInTiles, WMTUnixDeviceNewSpecializedRenderPipeline,
-       WMTUnixCallCount };
+       WMTUnixDeviceSparseResidencyInTiles, WMTUnixDeviceNewSpecializedRenderPipeline, WMTUnixBinaryArchiveAdd,
+       WMTUnixRemoveOtherVersions, WMTUnixCallCount };
 WINEMETAL_API obj_handle_t MTLCommandBuffer_sampledCommandEncoder(obj_handle_t cmdbuf, enum WMTSampledEncoder type,
                                                                   const struct WMTSampleBufferAttachmentInfo *samples,
                                                                   const struct WMTRenderPassInfo *render_info);

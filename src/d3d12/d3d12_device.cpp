@@ -312,9 +312,14 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DD
   std::string archive_path_;
   mullion::mutex archive_mutex_;
   mullion::condition_variable archive_changed_;
-  // pipelines added to the archive so far, and of them to its last shard
-  uint64_t archived_ = 0;
+  // the pipelines to add to the archive, oldest first, with the keys of the D3D12 pipelines they are made for, and how
+  // many its last shard has
+  std::deque<std::pair<WMT::Reference<WMT::Object>, Sha1Digest>> archive_adds_;
   uint32_t shard_archived_ = 0;
+  // the archive opened on a compile thread once a pipeline is left to its first draw (InArchive), which would open it
+  // otherwise: its files take seconds to open
+  std::once_flag archive_ahead_;
+  std::shared_ptr<DeferredPipeline> archive_opener_;
   bool archive_closing_ = false;
   mullion::thread archive_writer_;
   mullion::mutex depth_stencil_lock_;
@@ -323,14 +328,22 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DD
   std::unique_ptr<EventListener> event_listener_;
 
 public:
+  // the device as it answers what feature levels it reaches (CheckFeatureSupport of D3D12_FEATURE_FEATURE_LEVELS and
+  // the options they are made of), which D3D12CreateDevice asks before anything is built; Initialize makes the rest
   MTLD3D12DeviceImpl(IMTLDXGIAdapter *adapter)
       : adapter_(adapter), command_library(adapter_->GetMTLDevice()),
         metal_version_(SM50_SHADER_METAL_VERSION(ShaderMetalVersion(adapter_->GetMTLDevice()))),
         shader_flags_(GPUShaderFlags(adapter_->GetMTLDevice())) {
     mesh_bytes_per_draw = MeshBytesPerDraw(adapter_->GetMTLDevice());
+    if (GetMTLDevice().supportsPlacementSparse())
+      for (auto page : {WMTSparsePageSize16, WMTSparsePageSize64, WMTSparsePageSize256})
+        if (GetMTLDevice().sparseTileSizeInBytes(page) == D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES)
+          sparse_page_size_ = page;
   }
 
   ~MTLD3D12DeviceImpl() {
+    if (archive_opener_)
+      archive_opener_->Cancel();
     if (archive_writer_.joinable()) {
       {
         std::lock_guard lock(archive_mutex_);
@@ -370,6 +383,10 @@ public:
     }
     format_inspector_.Inspect(GetMTLDevice());
     keep_structure_inputs = Config::getInstance().getOption<bool>("d3d12.keepAccelerationStructureInputs", true);
+    emulate_depth_bounds = Config::getInstance().getOption<bool>("d3d12.emulateDepthBounds", true);
+    timestamp_queries = Config::getInstance().getOption<bool>("d3d12.timestampQueries", true);
+    immediate_markers = Config::getInstance().getOption<bool>("d3d12.immediateMarkers", false);
+    report_emulated_features = Config::getInstance().getOption<bool>("d3d12.reportEmulatedFeatures", false);
     
     WMTDepthStencilInfo info{};
     info.depth_compare_function = WMTCompareFunctionAlways;
@@ -409,10 +426,6 @@ public:
     }
     // a compute pipeline's thread execution width is the SIMD-group width
     simd_width_ = occlusion_sum.threadExecutionWidth();
-    if (GetMTLDevice().supportsPlacementSparse())
-      for (auto page : {WMTSparsePageSize16, WMTSparsePageSize64, WMTSparsePageSize256})
-        if (GetMTLDevice().sparseTileSizeInBytes(page) == D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES)
-          sparse_page_size_ = page;
     // each GPU core runs four SIMD groups at once; Metal reports neither, so it is an estimate, as on other drivers
     total_lanes_ = GetMTLDevice().gpuCoreCount() * 4 * simd_width_;
     // the lock words of 64-bit atomics (dxil_converter.cpp): as many as lanes run at once, a power of two, whose mask
@@ -536,19 +549,25 @@ public:
     return str::format(archive_path_, shard, ".metallib");
   }
 
+  // the program's archive is beside its shader cache, but not in a process that may be captured: Metal captures no
+  // mesh pipeline made with a binary archive ("Capturing Mesh Shaders with Binary Archives is not supported")
+  static bool
+  ArchiveKept() {
+    return !ShaderCacheDirectory().empty() && env::getEnvVar("MTL_CAPTURE_ENABLED") != "1";
+  }
+
   std::span<const obj_handle_t>
   PipelineArchives() override {
     std::call_once(archive_opened_, [this] {
-      auto directory = ShaderCacheDirectory();
-      // Metal captures no mesh pipeline made with a binary archive ("Capturing Mesh Shaders with Binary Archives is
-      // not supported"): a process that may be captured makes its pipelines without one
-      if (env::getEnvVar("MTL_CAPTURE_ENABLED") == "1")
-        return;
       WMT::Reference<WMT::Error> error;
       WMT::Reference<WMT::BinaryArchive> added;
-      if (directory.empty() || !(added = GetMTLDevice().newBinaryArchive(nullptr, error)))
+      if (!ArchiveKept() || !(added = GetMTLDevice().newBinaryArchive(nullptr, error)))
         return;
-      archive_path_ = str::format(directory, "pipelines_", uint32_t(metal_version_), "_");
+      // a converter version finds none of the pipelines another one archived, and every shard is read and held at
+      // start: the shards of the others go before any is read, as the shader store's do (CacheWriter_alloc_init)
+      auto pipelines = str::format(ShaderCacheDirectory(), "pipelines_", uint32_t(metal_version_), "_");
+      archive_path_ = str::format(pipelines, "v", kMullionShaderCacheVersion, "_");
+      WMTRemoveOtherVersions(pipelines.c_str(), archive_path_.c_str());
       // shards are read in order up to the first one Metal cannot read (none yet, or a damaged one), where this
       // launch's shards start
       while (archives_.size() + 1 < kMaxArchives)
@@ -565,60 +584,103 @@ public:
   }
 
   void
-  PipelineArchived() override {
+  ArchivePipeline(WMT::Object pipeline, const Sha1Digest &key) override {
     {
       std::lock_guard lock(archive_mutex_);
-      archived_++;
-      shard_archived_++;
+      archive_adds_.emplace_back(pipeline, key);
     }
     archive_changed_.notify_one();
   }
 
-  // writes the last shard once additions stop for as long as its last write took, or once it is full: a burst of new
-  // pipelines is written once, and pipelines wait on a write (archive_lock) only between bursts. the device's end
-  // writes what is left
+  // a D3D12 pipeline's key, with what of the device's its Metal pipelines are made by beside its description
+  Sha1Digest
+  ArchiveKey(const Sha1Digest &key) {
+    Sha1HashState h;
+    h.update(key);
+    h.update(uint32_t(shader_flags_));
+    h.update(UsesMetal4());
+    return h.final();
+  }
+
+  bool
+  InArchive(const Sha1Digest &key) override {
+    if (!ArchiveKept() || !ShaderCache::getInstance(WMTMetalVersion(metal_version_)).isArchived(ArchiveKey(key)))
+      return false;
+    std::call_once(archive_ahead_, [this] {
+      archive_opener_ = std::make_shared<DeferredPipeline>([this] { PipelineArchives(); });
+      DeferredPipeline::Queue(archive_opener_);
+    });
+    return true;
+  }
+
+  // adds the pipelines to the last shard, one at a time, and writes it once additions stop for as long as its last
+  // write took, or once it is full: a burst of new pipelines is written once. nothing else adds to a shard or writes
+  // one, so no add meets another or a write, and pipelines wait (archive_lock) only for a write, between bursts. the
+  // device's end adds and writes what is left
   void
   WriteArchive() {
     env::setThreadName("mullion-archive-thread");
     std::unique_lock lock(archive_mutex_);
-    uint64_t written = 0;
     std::chrono::steady_clock::duration took{};
+    // the D3D12 pipelines of the last shard's pipelines, recorded once it is written
+    std::vector<Sha1Digest> keys;
     for (;;) {
-      archive_changed_.wait(lock, [&] { return archive_closing_ || archived_ != written; });
-      auto full = [&] { return shard_archived_ >= kPipelinesPerArchive; };
-      for (uint64_t seen = written; !archive_closing_ && !full() && seen != archived_;) {
-        seen = archived_;
-        archive_changed_.wait_for(lock, took, [&] { return archive_closing_ || full(); });
+      archive_changed_.wait(lock, [&] { return archive_closing_ || !archive_adds_.empty(); });
+      while (!archive_adds_.empty() && shard_archived_ < kPipelinesPerArchive) {
+        auto [pipeline, key] = std::move(archive_adds_.front());
+        archive_adds_.pop_front();
+        lock.unlock();
+        // every shard was lost to a fault in Metal and no new one could be made: the pipelines are not kept
+        if (!archives_.empty())
+          archives_.back().add(pipeline);
+        keys.push_back(key);
+        pipeline = nullptr;
+        lock.lock();
+        shard_archived_++;
       }
-      if (archived_ == written)
+      if (shard_archived_ < kPipelinesPerArchive && !archive_closing_ &&
+          archive_changed_.wait_for(lock, took, [&] { return archive_closing_ || !archive_adds_.empty(); }))
+        continue;
+      if (!shard_archived_)
         return;
-      bool closing = archive_closing_;
+      bool last = archive_closing_ && archive_adds_.empty();
       lock.unlock();
       auto start = std::chrono::steady_clock::now();
       WMT::Reference<WMT::Error> error;
-      auto path = ShardPath(archives_.size() - 1);
-      uint64_t target;
-      {
+      std::string path;
+      if (!archives_.empty()) {
+        path = ShardPath(archives_.size() - 1);
         std::lock_guard whole(archive_lock);
-        archives_.back().serialize(path.c_str(), error);
+        if (!archives_.back().serialize(path.c_str(), error)) {
+          // Metal faulted writing the shard and holds its queue from then on, so a pipeline looked up in it, and its
+          // release, would wait for good: the shard is left as it is, with the pipelines it held, and is no longer
+          // looked up. those pipelines are compiled again by the next launch
+          ERR("Metal faulted writing the pipeline archive ", path, "; its ", shard_archived_, " pipelines are not kept");
+          archives_.back().handle = NULL_OBJECT_HANDLE;
+          archives_.pop_back();
+          archive_handles_.pop_back();
+        } else {
+          auto &cache = ShaderCache::getInstance(WMTMetalVersion(metal_version_));
+          for (auto &key : keys)
+            cache.setArchived(ArchiveKey(key));
+        }
         // the next pipelines go to a new shard: Metal fails to write an archive again once it holds a pipeline whose
         // vertex function it held before (macOS 27.3: "expecting 'fragment' stage in pipeline no. '1'")
         WMT::Reference<WMT::Error> unused;
-        if (!closing && archives_.size() < kMaxArchives)
+        if (!last && archives_.size() < kMaxArchives)
           if (auto next = GetMTLDevice().newBinaryArchive(nullptr, unused)) {
             archive_handles_.push_back(next.handle);
             archives_.push_back(std::move(next));
           }
-        // no pipeline is added while the archive is written whole
-        std::lock_guard counts(archive_mutex_);
-        target = archived_;
-        shard_archived_ = 0;
       }
+      keys.clear();
       took = std::chrono::steady_clock::now() - start;
       if (error)
         ERR("Failed to write the pipeline archive ", path, ": ", error.description().getUTF8String());
       lock.lock();
-      written = target;
+      shard_archived_ = 0;
+      if (last)
+        return;
     }
   }
 
@@ -875,6 +937,13 @@ public:
       CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &o7, sizeof(o7));
       CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model, sizeof(model));
       CheckFeatureSupport(D3D12_FEATURE_ROOT_SIGNATURE, &root, sizeof(root));
+      // the level is the implementation's: tiers d3d12.reportEmulatedFeatures leaves out are still there for an
+      // application that asks for the level and not for them
+      if (!report_emulated_features) {
+        o.ConservativeRasterizationTier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_3;
+        o6.VariableShadingRateTier = D3D12_VARIABLE_SHADING_RATE_TIER_2;
+        o7.SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_1_0;
+      }
       bool level_12_2 =
           model.HighestShaderModel >= D3D_SHADER_MODEL_6_5 && o5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1 &&
           o6.VariableShadingRateTier >= D3D12_VARIABLE_SHADING_RATE_TIER_2 &&
@@ -944,7 +1013,9 @@ public:
       out->ROVsSupported = TRUE;
       // emulated: the mesh stage grows triangles, degenerate ones too, and the pixel shader takes the pixels they
       // overlap and knows those inside (airconv)
-      out->ConservativeRasterizationTier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_3;
+      out->ConservativeRasterizationTier = report_emulated_features
+                                               ? D3D12_CONSERVATIVE_RASTERIZATION_TIER_3
+                                               : D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
       out->MaxGPUVirtualAddressBitsPerResource = 48;
       out->StandardSwizzle64KBSupported = FALSE;
       out->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
@@ -969,7 +1040,9 @@ public:
       out->DepthBoundsTestSupported = TRUE;
       // every Apple GPU family places samples where a render pass says (Metal feature set tables), one pattern for
       // all pixels
-      out->ProgrammableSamplePositionsTier = D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_1;
+      out->ProgrammableSamplePositionsTier = report_emulated_features
+                                                 ? D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_1
+                                                 : D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS3: {
@@ -1043,7 +1116,8 @@ public:
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7 *>(pFeatureData);
       out->MeshShaderTier = D3D12_MESH_SHADER_TIER_1;
       // 1.0 would need the first mip and slice of a paired texture's view in the shader
-      out->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_1_0;
+      out->SamplerFeedbackTier =
+          report_emulated_features ? D3D12_SAMPLER_FEEDBACK_TIER_1_0 : D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
       return S_OK;
     }
     case D3D12_FEATURE_SHADER_CACHE: {
@@ -1185,8 +1259,9 @@ public:
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS6 *>(pFeatureData);
       out->AdditionalShadingRatesSupported = FALSE;
       out->PerPrimitiveShadingRateSupportedWithViewportIndexing = FALSE;
-      out->VariableShadingRateTier = D3D12_VARIABLE_SHADING_RATE_TIER_2;
-      out->ShadingRateImageTileSize = 16;
+      out->VariableShadingRateTier = report_emulated_features ? D3D12_VARIABLE_SHADING_RATE_TIER_2
+                                                              : D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
+      out->ShadingRateImageTileSize = report_emulated_features ? 16 : 0;
       out->BackgroundProcessingSupported = FALSE;
       return S_OK;
     }
@@ -1528,56 +1603,10 @@ public:
       const D3D12_CPU_DESCRIPTOR_HANDLE *SrcDescriptorRangeOffsets, const UINT *SrcDescriptorRangeSizes,
       D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapType
   ) {
-    unsigned int dst_range_idx, dst_idx, src_range_idx, src_idx;
-    unsigned int dst_range_size, src_range_size, copy_count;
-
-    dst_range_idx = dst_idx = 0;
-    src_range_idx = src_idx = 0;
-    while (dst_range_idx < DstDescriptorRangeCount && src_range_idx < SrcDescriptorRangeCount) {
-      dst_range_size = DstDescriptorRangeSizes ? DstDescriptorRangeSizes[dst_range_idx] : 1;
-      src_range_size = SrcDescriptorRangeSizes ? SrcDescriptorRangeSizes[src_range_idx] : 1;
-
-      copy_count = std::min(dst_range_size - dst_idx, src_range_size - src_idx);
-
-      switch (DescriptorHeapType) {
-      case D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV: {
-        auto [DstRangeHeap, DstRangeIndex] =
-            GetShaderVisibleDescriptorHeap(this, DstDescriptorRangeOffsets[dst_range_idx]);
-        auto [SrcRangeHeap, SrcRangeIndex] =
-            GetShaderVisibleDescriptorHeap(this, SrcDescriptorRangeOffsets[src_range_idx]);
-        SrcRangeHeap->CopyDescriptors(SrcRangeIndex + src_idx, DstRangeHeap, DstRangeIndex + dst_idx, copy_count);
-        break;
-      }
-
-      case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER: {
-        auto [DstRangeHeap, DstRangeIndex] = GetSamplerDescriptorHeap(this, DstDescriptorRangeOffsets[dst_range_idx]);
-        auto [SrcRangeHeap, SrcRangeIndex] = GetSamplerDescriptorHeap(this, SrcDescriptorRangeOffsets[src_range_idx]);
-        SrcRangeHeap->CopyDescriptors(SrcRangeIndex + src_idx, DstRangeHeap, DstRangeIndex + dst_idx, copy_count);
-        break;
-      }
-      case D3D12_DESCRIPTOR_HEAP_TYPE_RTV:
-      case D3D12_DESCRIPTOR_HEAP_TYPE_DSV: {
-        auto [DstRangeHeap, DstRangeIndex] = GetRenderTargetHeap(this, DstDescriptorRangeOffsets[dst_range_idx]);
-        auto [SrcRangeHeap, SrcRangeIndex] = GetRenderTargetHeap(this, SrcDescriptorRangeOffsets[src_range_idx]);
-        SrcRangeHeap->CopyDescriptors(SrcRangeIndex + src_idx, DstRangeHeap, DstRangeIndex + dst_idx, copy_count);
-        break;
-      }
-      default:
-        return;
-      }
-
-      dst_idx += copy_count;
-      src_idx += copy_count;
-
-      if (dst_idx >= dst_range_size) {
-        ++dst_range_idx;
-        dst_idx = 0;
-      }
-      if (src_idx >= src_range_size) {
-        ++src_range_idx;
-        src_idx = 0;
-      }
-    }
+    mullion::CopyDescriptors(
+        this, DstDescriptorRangeCount, DstDescriptorRangeOffsets, DstDescriptorRangeSizes, SrcDescriptorRangeCount,
+        SrcDescriptorRangeOffsets, SrcDescriptorRangeSizes, DescriptorHeapType
+    );
   };
 
   void STDMETHODCALLTYPE
@@ -1585,8 +1614,8 @@ public:
       UINT DescriptorCount, const D3D12_CPU_DESCRIPTOR_HANDLE DstDescriptorRangeOffset,
       const D3D12_CPU_DESCRIPTOR_HANDLE SrcDescriptorRangeOffset, D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapType
   ) {
-    CopyDescriptors(
-        1, &DstDescriptorRangeOffset, &DescriptorCount, 1, &SrcDescriptorRangeOffset, &DescriptorCount,
+    mullion::CopyDescriptors(
+        this, 1, &DstDescriptorRangeOffset, &DescriptorCount, 1, &SrcDescriptorRangeOffset, &DescriptorCount,
         DescriptorHeapType
     );
   };
@@ -2070,15 +2099,13 @@ public:
     return OpenExistingHeapFromAddress(pAddress, riid, ppHeap);
   }
 
-  // ID3D12Device14: root signatures of DXIL libraries' subobjects are not read
+  // ID3D12Device14: the root signature a DXIL library's subobject of that name defines
   HRESULT STDMETHODCALLTYPE
   CreateRootSignatureFromSubobjectInLibrary(
       UINT nodeMask, const void *pLibraryBlob, SIZE_T blobLengthInBytes, LPCWSTR subobjectName, REFIID riid,
       void **ppvRootSignature
   ) final {
-    InitReturnPtr(ppvRootSignature);
-    WARN("CreateRootSignatureFromSubobjectInLibrary: not supported");
-    return E_NOTIMPL;
+    return CreateLibraryRootSignature(this, pLibraryBlob, blobLengthInBytes, subobjectName, riid, ppvRootSignature);
   }
 
   // ID3D12Device15: no memory budget is trimmed, so a callback is registered and never called
@@ -2728,6 +2755,11 @@ public:
       return {};
     }
     --iter;
+    // an address past the end of the buffer below it is in no buffer: between two, or of one that is gone
+    if (VA - iter->first >= iter->second->info().length) {
+      *pOffset = 0;
+      return {};
+    }
     if (pEnd)
       *pEnd = std::min(*pEnd, iter->first + iter->second->info().length);
     *pOffset = VA - iter->first;
@@ -3150,24 +3182,50 @@ AccelerationStructure::~AccelerationStructure() {
 }
 
 HRESULT
-CreateD3D12Device(IMTLDXGIAdapter *adapter, const IID &riid, void **ppDevice) {
+CreateD3D12Device(IMTLDXGIAdapter *adapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, const IID &riid, void **ppDevice) {
   DXGI_ADAPTER_DESC desc;
   HRESULT hr = adapter->GetDesc(&desc);
   if (FAILED(hr))
     return hr;
+  // released after the lock, which a device takes as it is destroyed
+  Com<MTLD3D12DeviceImpl> device;
   // under the lock, so that two calls at once make one device
   std::lock_guard lock(device_singletons_lock);
-  Com<MTLD3D12DeviceImpl> device;
   for (auto &[luid, existing] : device_singletons)
     if (luid.LowPart == desc.AdapterLuid.LowPart && luid.HighPart == desc.AdapterLuid.HighPart &&
         existing->AddRefIfReferenced())
       device = Com<MTLD3D12DeviceImpl>::transfer(existing);
-  if (device) {
+  bool held = device != nullptr;
+  if (held) {
     if (FAILED(hr = device->GetDeviceRemovedReason()))
       return hr;
-    return device->QueryInterface(riid, ppDevice);
+  } else {
+    device = Com(new MTLD3D12DeviceImpl(adapter));
   }
-  device = Com(new MTLD3D12DeviceImpl(adapter));
+  // the level is asked of a device that is not built yet: a level it does not reach builds nothing, and neither does
+  // a call without ppDevice, which only tests whether the adapter supports the level (Microsoft Learn,
+  // D3D12CreateDevice, ppDevice). middleware asks so for each level in turn before any device is created
+  D3D12_FEATURE_DATA_FEATURE_LEVELS levels{1, &MinimumFeatureLevel};
+  if (FAILED(hr = device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &levels, sizeof(levels))))
+    return hr;
+  if (levels.MaxSupportedFeatureLevel != MinimumFeatureLevel) {
+    WARN("D3D12CreateDevice: feature level ", MinimumFeatureLevel, " is not supported");
+    // an application may end over this with no word of ours, so the flight recorder has what the device reaches, and
+    // the first refusal of a process writes its records. level 12_0 needs tiled resources tier 2, which the device
+    // has where Metal has placement sparse resources (macOS 26.4)
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options));
+    FLIGHT("D3D12CreateDevice refuses feature level %#llx: the device reaches %#llx, tiled resources tier %llu",
+           uint64_t(MinimumFeatureLevel), uint64_t(device->GetFeatureLevel()), uint64_t(options.TiledResourcesTier));
+    static std::atomic_flag written;
+    if (!written.test_and_set())
+      WMTFlightDump("a refused feature level");
+    return E_INVALIDARG;
+  }
+  if (!ppDevice)
+    return S_FALSE;
+  if (held)
+    return device->QueryInterface(riid, ppDevice);
   if (FAILED(hr = device->Initialize()))
     return hr;
   std::erase_if(device_singletons, [&](auto &entry) {
